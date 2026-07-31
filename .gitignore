@@ -1,0 +1,32 @@
+.build/
+.xcode-derived/
+.DS_Store
+.env
+.env.local
+secrets.env
+*.secrets
+xcuserdata/
+DerivedData/
+*.xcuserstate
+/.xcode-derived-signed-dev
+/recovered
+/ShippedResources
+/AppResources/Odysseus/ClaudeAgentSDKBridge/node_modules/
+
+worker/.dev.vars
+worker/.env
+worker/.env.local
+/AppResources/Odysseus/CodexRuntime
+/.codesurf
+/.contex
+/output
+
+# Release build artifacts
+/build/
+/dist/
+*.xcarchive
+
+# Local-only MCP server URL (port rotates between launches)
+.mcp.json
+/.antigravitycli
+/cascade
