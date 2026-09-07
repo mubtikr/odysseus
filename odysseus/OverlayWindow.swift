@@ -1,0 +1,3235 @@
+//
+//  OverlayWindow.swift
+//  odysseus
+//
+//  System-wide transparent overlay window for the Odysseus cursor companion.
+//  One OverlayWindow is created per screen so the cursor buddy
+//  seamlessly follows the cursor across multiple monitors.
+//
+
+import AppKit
+import OCComputerUseCore
+import Combine
+import SwiftUI
+import UniformTypeIdentifiers
+
+// MARK: - AgentParkingPosition
+
+/// Where the agent dock parks itself on the active screen. Eight anchor
+/// points: four corners, four mid-edges. Default is top-right because
+/// that's where most users put their menubar/notification stack — the
+/// dock blends with that visual line without competing for the bottom
+/// Dock area. `nonisolated` so the type can be referenced from any
+/// actor context (the dock manager calls `originForWindow` from
+/// `@MainActor`; CompanionManager bindings cross actors freely).
+nonisolated enum AgentParkingPosition: String, CaseIterable, Identifiable {
+    case topLeft = "topLeft"
+    case topCenter = "topCenter"
+    case topRight = "topRight"
+    case middleLeft = "middleLeft"
+    case middleRight = "middleRight"
+    case bottomLeft = "bottomLeft"
+    case bottomCenter = "bottomCenter"
+    case bottomRight = "bottomRight"
+
+    static let `default`: AgentParkingPosition = .topRight
+    static let userDefaultsKey = "odysseus.agentParkingPosition"
+    private static let calibrationDefaultsPrefix = "odysseus.agentParkingCalibration"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .topLeft: return "Top Left"
+        case .topCenter: return "Top"
+        case .topRight: return "Top Right"
+        case .middleLeft: return "Left"
+        case .middleRight: return "Right"
+        case .bottomLeft: return "Bottom Left"
+        case .bottomCenter: return "Bottom"
+        case .bottomRight: return "Bottom Right"
+        }
+    }
+
+    /// Computes the origin (bottom-left in AppKit coords) for a window
+    /// of `size` parked on `screen` at this anchor. Uses `visibleFrame`
+    /// so the dock respects the menu bar and system Dock.
+    func originForWindow(size: NSSize, on screen: NSScreen, edgeInset: CGFloat = 16) -> CGPoint {
+        let frame = screen.frame
+        let visible = screen.visibleFrame
+
+        let xLeft = visible.minX + edgeInset
+        let xRight = visible.maxX - size.width - edgeInset
+        let xCenter = visible.midX - size.width / 2
+
+        let yTop = visible.maxY - size.height - max(edgeInset, frame.maxY - visible.maxY + 8)
+        let yBottom = visible.minY + edgeInset
+        let yMiddle = visible.midY - size.height / 2
+
+        let baseOrigin: CGPoint
+        switch self {
+        case .topLeft:      baseOrigin = CGPoint(x: xLeft, y: yTop)
+        case .topCenter:    baseOrigin = CGPoint(x: xCenter, y: yTop)
+        case .topRight:     baseOrigin = CGPoint(x: xRight, y: yTop)
+        case .middleLeft:   baseOrigin = CGPoint(x: xLeft, y: yMiddle)
+        case .middleRight:  baseOrigin = CGPoint(x: xRight, y: yMiddle)
+        case .bottomLeft:   baseOrigin = CGPoint(x: xLeft, y: yBottom)
+        case .bottomCenter: baseOrigin = CGPoint(x: xCenter, y: yBottom)
+        case .bottomRight:  baseOrigin = CGPoint(x: xRight, y: yBottom)
+        }
+
+        let calibrationOffset = Self.calibrationOffset(for: self)
+        return CGPoint(
+            x: baseOrigin.x + calibrationOffset.width,
+            y: baseOrigin.y + calibrationOffset.height
+        )
+    }
+
+    /// Anchor in [0,1]x[0,1] for the preview picker. (0,0) = the
+    /// true top-left of the represented screen in SwiftUI drawing
+    /// coordinates, so the parking indicator matches real display
+    /// corners instead of an inset approximation.
+    var opensAgentPanelsToRight: Bool {
+        switch self {
+        case .topLeft, .middleLeft, .bottomLeft:
+            return true
+        case .topCenter, .topRight, .middleRight, .bottomCenter, .bottomRight:
+            return false
+        }
+    }
+
+    var normalizedAnchor: CGPoint {
+        switch self {
+        case .topLeft:      return CGPoint(x: 0.0, y: 0.0)
+        case .topCenter:    return CGPoint(x: 0.5, y: 0.0)
+        case .topRight:     return CGPoint(x: 1.0, y: 0.0)
+        case .middleLeft:   return CGPoint(x: 0.0, y: 0.5)
+        case .middleRight:  return CGPoint(x: 1.0, y: 0.5)
+        case .bottomLeft:   return CGPoint(x: 0.0, y: 1.0)
+        case .bottomCenter: return CGPoint(x: 0.5, y: 1.0)
+        case .bottomRight:  return CGPoint(x: 1.0, y: 1.0)
+        }
+    }
+
+    static func calibrationOffset(for position: AgentParkingPosition) -> CGSize {
+        let defaults = UserDefaults.standard
+        return CGSize(
+            width: defaults.double(forKey: calibrationKey(for: position, axis: "x")),
+            height: defaults.double(forKey: calibrationKey(for: position, axis: "y"))
+        )
+    }
+
+    static func setCalibrationOffset(_ offset: CGSize, for position: AgentParkingPosition) {
+        let clampedOffset = CGSize(
+            width: min(max(offset.width, -220), 220),
+            height: min(max(offset.height, -180), 180)
+        )
+        let defaults = UserDefaults.standard
+        defaults.set(clampedOffset.width, forKey: calibrationKey(for: position, axis: "x"))
+        defaults.set(clampedOffset.height, forKey: calibrationKey(for: position, axis: "y"))
+    }
+
+    private static func calibrationKey(for position: AgentParkingPosition, axis: String) -> String {
+        "\(calibrationDefaultsPrefix).\(position.rawValue).\(axis)"
+    }
+}
+
+class OverlayWindow: NSWindow {
+    init(screen: NSScreen) {
+        // Create window covering entire screen
+        super.init(
+            contentRect: screen.frame,
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+
+        // Make window transparent and click-through. A content-view `hitTest`
+        // returning nil does NOT pass clicks to the app behind, so the window
+        // itself must ignore events to stay transparent.
+        self.isOpaque = false
+        self.backgroundColor = .clear
+        OdysseusWindowLevels.applyCursorOverlayLevel(to: self)
+        self.ignoresMouseEvents = true
+        self.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        self.isReleasedWhenClosed = false
+        self.hasShadow = false
+
+        // Important: Allow the window to appear even when app is not active
+        self.hidesOnDeactivate = false
+
+        // Cover the entire screen
+        self.setFrame(screen.frame, display: true)
+
+        // Make sure it's on the right screen
+        if let screenForWindow = NSScreen.screens.first(where: { $0.frame == screen.frame }) {
+            self.setFrameOrigin(screenForWindow.frame.origin)
+        }
+    }
+
+    // Prevent window from becoming key (no focus stealing)
+    override var canBecomeKey: Bool {
+        return false
+    }
+
+    override var canBecomeMain: Bool {
+        return false
+    }
+}
+
+/// Cursor avatar styles.
+///
+/// Stored as a `String` (with embedded payload for `.pet`) so it round-trips
+/// through `@AppStorage` and `UserDefaults` cleanly.
+///
+/// Legacy values:
+///   - `"triangle"` (pre-fork single triangle) ➝ treated as `.triangleFilled`.
+///   - `"paperclip"` (removed; was hardcoded clippy) ➝ falls back to default.
+///   - `"customAsset"` (single static template image) ➝ falls back to default.
+enum OdysseusCursorAvatarStyle: Equatable {
+    case triangleFilled
+    case triangleOutline
+    case pet(id: String)
+
+    static let userDefaultsKey = "odysseus.cursorAvatarStyle"
+    static let `default`: OdysseusCursorAvatarStyle = .triangleFilled
+
+    /// Storage representation. `.pet(id)` is encoded as `"pet:<id>"`.
+    var storageValue: String {
+        switch self {
+        case .triangleFilled:    return "triangleFilled"
+        case .triangleOutline:   return "triangleOutline"
+        case .pet(let id):       return "pet:\(id)"
+        }
+    }
+
+    init(storageValue raw: String) {
+        switch raw {
+        case "triangleFilled", "triangle", "":
+            self = .triangleFilled
+        case "triangleOutline":
+            self = .triangleOutline
+        // Legacy values we no longer support — fall back to default.
+        case "paperclip", "customAsset":
+            self = .triangleFilled
+        default:
+            if raw.hasPrefix("pet:") {
+                let id = String(raw.dropFirst("pet:".count))
+                if !id.isEmpty {
+                    self = .pet(id: id)
+                    return
+                }
+            }
+            self = .triangleFilled
+        }
+    }
+
+    /// Whether the parent view should apply rotation to this avatar.
+    /// Triangles point in a direction; pets always face up and use their
+    /// own running-left/running-right rows for direction.
+    var honorsParentRotation: Bool {
+        switch self {
+        case .triangleFilled, .triangleOutline: return true
+        case .pet:                              return false
+        }
+    }
+}
+
+enum OdysseusCursorAvatarSizePreference {
+    static let userDefaultsKey = "odysseus.cursorAvatarSizeScale"
+    static let defaultScale: Double = 1.0
+    static let minScale: Double = 0.65
+    static let maxScale: Double = 1.85
+}
+
+private struct OdysseusCursorAvatarView: View {
+    let accentColor: Color
+    var showsEyes: Bool = true
+    /// High-level animation state used when rendering a pet. Ignored for
+    /// triangle styles. Default is `.idle` so the existing call sites that
+    /// don't have a state machine still render cleanly.
+    var animationState: OdysseusBuddyAnimationState = .idle
+    @AppStorage(OdysseusCursorAvatarStyle.userDefaultsKey) private var avatarStyleRawValue = OdysseusCursorAvatarStyle.default.storageValue
+    @ObservedObject private var petLibrary = OdysseusBuddyPetLibrary.shared
+
+    private var avatarStyle: OdysseusCursorAvatarStyle {
+        OdysseusCursorAvatarStyle(storageValue: avatarStyleRawValue)
+    }
+
+    var body: some View {
+        switch avatarStyle {
+        case .triangleFilled:
+            OdysseusTriangleCursorView(accentColor: accentColor, style: .filled)
+        case .triangleOutline:
+            OdysseusTriangleCursorView(accentColor: accentColor, style: .outline)
+        case .pet(let id):
+            if let pet = petLibrary.pet(withID: id) {
+                OdysseusPetSpriteView(pet: pet, animationState: animationState)
+            } else {
+                // Pet referenced but not installed (yet) — graceful fallback
+                // keeps the cursor visible while the user re-picks or hatches.
+                OdysseusTriangleCursorView(accentColor: accentColor, style: .filled)
+            }
+        }
+    }
+}
+
+private struct OdysseusTriangleCursorView: View {
+    enum Style { case filled, outline }
+    let accentColor: Color
+    let style: Style
+
+    var body: some View {
+        ZStack {
+            switch style {
+            case .filled:
+                OdysseusTriangleShape()
+                    .fill(accentColor)
+                    .shadow(color: accentColor.opacity(0.45), radius: 4)
+            case .outline:
+                OdysseusTriangleShape()
+                    .stroke(accentColor.opacity(0.34), style: StrokeStyle(lineWidth: 8.0, lineJoin: .round))
+                    .blur(radius: 1.8)
+                OdysseusTriangleShape()
+                    .stroke(accentColor, style: StrokeStyle(lineWidth: 3.2, lineJoin: .round))
+            }
+        }
+        .aspectRatio(0.86, contentMode: .fit)
+    }
+}
+
+private struct OdysseusTriangleShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let size = min(rect.width, rect.height) * 0.82
+        let height = size * sqrt(3.0) / 2.0
+        let top = CGPoint(x: center.x, y: center.y + height * 0.56)
+        let bottomLeft = CGPoint(x: center.x - size / 2.0, y: center.y - height * 0.44)
+        let bottomRight = CGPoint(x: center.x + size / 2.0, y: center.y - height * 0.44)
+
+        path.move(to: top)
+        path.addLine(to: bottomLeft)
+        path.addLine(to: bottomRight)
+        path.closeSubpath()
+        return path
+    }
+}
+
+private struct OdysseusCalibrationCursorBoxView: View {
+    let color: Color
+    let reduceMotion: Bool
+    @State private var pulse = false
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .stroke(
+                color,
+                style: StrokeStyle(lineWidth: 2.8, lineCap: .round, lineJoin: .round)
+            )
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(color.opacity(0.08))
+            )
+            .shadow(color: color.opacity(reduceMotion ? 0.32 : 0.76), radius: reduceMotion ? 4 : 10)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(color.opacity(0.32), lineWidth: 7)
+                    .blur(radius: 1.5)
+            )
+            .scaleEffect(reduceMotion ? 1 : (pulse ? 1.04 : 0.98))
+            .onAppear {
+                guard !reduceMotion else { return }
+                withAnimation(.easeInOut(duration: 0.82).repeatForever(autoreverses: true)) {
+                    pulse = true
+                }
+            }
+    }
+}
+
+// PreferenceKey for tracking bubble size
+struct SizePreferenceKey: PreferenceKey {
+    static let defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
+    }
+}
+
+struct NavigationBubbleSizePreferenceKey: PreferenceKey {
+    static let defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
+    }
+}
+
+struct AgentTaskBubbleSizePreferenceKey: PreferenceKey {
+    static let defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
+    }
+}
+
+struct ExternalProxyBubbleSizePreferenceKey: PreferenceKey {
+    static let defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
+    }
+}
+
+/// The buddy's behavioral mode. Controls whether it follows the cursor,
+/// is flying toward a detected UI element, or is pointing at an element.
+
+nonisolated enum OdysseusResponseCaptionFont: String, CaseIterable, Identifiable {
+    case systemRounded
+    case systemSerif
+    case systemMonospaced
+    case avenirRounded
+    case avenirNext
+    case helveticaNeue
+    case georgia
+    case baskerville
+    case palatino
+    case markerFelt
+    case chalkboard
+    case comicSans
+    case noteworthy
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .systemRounded: return "System Rounded"
+        case .systemSerif: return "System Serif"
+        case .systemMonospaced: return "System Mono"
+        case .avenirRounded: return "Avenir Rounded"
+        case .avenirNext: return "Avenir Next"
+        case .helveticaNeue: return "Helvetica Neue"
+        case .georgia: return "Georgia"
+        case .baskerville: return "Baskerville"
+        case .palatino: return "Palatino"
+        case .markerFelt: return "Marker Felt"
+        case .chalkboard: return "Chalkboard"
+        case .comicSans: return "Comic Sans"
+        case .noteworthy: return "Noteworthy"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .systemRounded: return "Clean default"
+        case .systemSerif: return "Bookish serif"
+        case .systemMonospaced: return "Code-like mono"
+        case .avenirRounded: return "Friendly rounded"
+        case .avenirNext: return "Modern sans"
+        case .helveticaNeue: return "Classic sans"
+        case .georgia: return "Readable serif"
+        case .baskerville: return "Elegant serif"
+        case .palatino: return "Warm serif"
+        case .markerFelt: return "Cartoon marker"
+        case .chalkboard: return "Comic board"
+        case .comicSans: return "Comic book"
+        case .noteworthy: return "Handwritten"
+        }
+    }
+
+    var fontName: String? {
+        switch self {
+        case .systemRounded, .systemSerif, .systemMonospaced: return nil
+        case .avenirRounded: return "Avenir Next Rounded"
+        case .avenirNext: return "Avenir Next"
+        case .helveticaNeue: return "Helvetica Neue"
+        case .georgia: return "Georgia"
+        case .baskerville: return "Baskerville"
+        case .palatino: return "Palatino"
+        case .markerFelt: return "Marker Felt"
+        case .chalkboard: return "Chalkboard SE"
+        case .comicSans: return "Comic Sans MS"
+        case .noteworthy: return "Noteworthy"
+        }
+    }
+
+    static var fallback: OdysseusResponseCaptionFont { .systemRounded }
+
+    static func resolved(_ rawValue: String) -> OdysseusResponseCaptionFont {
+        OdysseusResponseCaptionFont(rawValue: rawValue) ?? .fallback
+    }
+
+    func swiftUIFont(size: CGFloat, weight: Font.Weight = .semibold) -> Font {
+        if let fontName {
+            return .custom(fontName, size: size).weight(weight)
+        }
+        switch self {
+        case .systemSerif:
+            return .system(size: size, weight: weight, design: .serif)
+        case .systemMonospaced:
+            return .system(size: size, weight: weight, design: .monospaced)
+        default:
+            return .system(size: size, weight: weight, design: .rounded)
+        }
+    }
+}
+
+enum BuddyNavigationMode {
+    /// Default — buddy follows the mouse cursor with spring animation
+    case followingCursor
+    /// Buddy is animating toward a detected UI element location
+    case navigatingToTarget
+    /// Buddy has arrived at the target and is pointing at it with a speech bubble
+    case pointingAtTarget
+}
+
+// SwiftUI view for the glowing cursor companion.
+// Each screen gets its own BlueCursorView. The view checks whether
+// the cursor is currently on THIS screen and only shows the buddy
+// mascot when it is. During voice interaction, the mascot is
+// replaced by a waveform (listening), spinner (processing), or
+// streaming text bubble (responding).
+struct BlueCursorView: View {
+    let screenFrame: CGRect
+    let isFirstAppearance: Bool
+    let companionManager: CompanionManager
+    @ObservedObject var cursorState: CursorOverlayState
+    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
+    @AppStorage(OdysseusAccentTheme.userDefaultsKey) private var selectedAccentThemeID = OdysseusAccentTheme.mint.rawValue
+    @AppStorage(OdysseusCursorAvatarSizePreference.userDefaultsKey) private var cursorAvatarSizeScale = OdysseusCursorAvatarSizePreference.defaultScale
+    @AppStorage(AppBundleConfiguration.userVoiceResponseCaptionFontDefaultsKey) private var voiceResponseCaptionFontRawValue = OdysseusResponseCaptionFont.fallback.rawValue
+    @AppStorage(AppBundleConfiguration.userVoiceResponseCaptionOpacityDefaultsKey) private var voiceResponseCaptionOpacity = AppBundleConfiguration.defaultVoiceResponseCaptionOpacity
+
+    @State private var cursorPosition: CGPoint
+    @State private var isCursorOnThisScreen: Bool
+
+    init(screenFrame: CGRect, isFirstAppearance: Bool, companionManager: CompanionManager) {
+        self.screenFrame = screenFrame
+        self.isFirstAppearance = isFirstAppearance
+        self.companionManager = companionManager
+        self.cursorState = companionManager.cursorOverlayState
+
+        // Seed the cursor position from the current mouse location so the
+        // buddy doesn't flash at (0,0) before onAppear fires.
+        let mouseLocation = NSEvent.mouseLocation
+        let localX = mouseLocation.x - screenFrame.origin.x
+        let localY = screenFrame.height - (mouseLocation.y - screenFrame.origin.y)
+        _cursorPosition = State(initialValue: CGPoint(x: localX + 35, y: localY + 25))
+        _isCursorOnThisScreen = State(initialValue: screenFrame.contains(mouseLocation))
+    }
+    @State private var welcomeTypingTimer: Timer?
+    /// High-priority background timer that drives cursor tracking. Held
+    /// as a strong reference so the source isn't deallocated mid-tick.
+    /// We sample on a `userInteractive` queue (not @MainActor) so the
+    /// buddy stays smooth even when the main thread is busy with SwiftUI
+    /// animation work or LLM streaming. Hops to main only when the cursor
+    /// has actually moved.
+    @State private var cursorTrackingTimer: DispatchSourceTimer?
+    @State private var welcomeText: String = ""
+    @State private var showWelcome: Bool = true
+    @State private var bubbleSize: CGSize = .zero
+    @State private var agentTaskBubbleSize: CGSize = .zero
+    @State private var bubbleOpacity: Double = 1.0
+    @State private var cursorOpacity: Double = 0.0
+
+    // MARK: - Buddy Navigation State
+
+    /// The buddy's current behavioral mode (following cursor, navigating, or pointing).
+    @State private var buddyNavigationMode: BuddyNavigationMode = .followingCursor
+
+    /// Baseline clockwise tilt for triangle cursor avatars.
+    private let triangleBaseRotationDegrees: Double = 12.0
+
+    /// The rotation angle of the cursor companion in degrees.
+    /// Changes to face the direction of travel when navigating to a target.
+    @State private var buddyRotationDegrees: Double = 12.0
+
+    /// Speech bubble text shown when pointing at a detected element.
+    @State private var navigationBubbleText: String = ""
+    @State private var navigationBubbleOpacity: Double = 0.0
+    @State private var navigationBubbleSize: CGSize = .zero
+
+    /// The cursor position at the moment navigation started, used to detect
+    /// if the user moves the cursor enough to cancel the navigation.
+    @State private var cursorPositionWhenNavigationStarted: CGPoint = .zero
+
+    /// Timer driving the frame-by-frame bezier arc flight animation.
+    /// Invalidated when the flight completes, is canceled, or the view disappears.
+    @State private var navigationAnimationTimer: Timer?
+
+    /// Scale factor applied to the buddy mascot during flight. Grows to ~1.3x
+    /// at the midpoint of the arc and shrinks back to 1.0x on landing, creating
+    /// an energetic "swooping" feel.
+    @State private var buddyFlightScale: CGFloat = 1.0
+
+    /// Scale factor for the navigation speech bubble's pop-in entrance.
+    /// Starts at 0.5 and springs to 1.0 when the first character appears.
+    @State private var navigationBubbleScale: CGFloat = 1.0
+
+    /// True when the buddy is flying BACK to the cursor after pointing.
+    /// Only during the return flight can cursor movement cancel the animation.
+    @State private var isReturningToCursor: Bool = false
+
+    // MARK: - Pet animation state
+    //
+    // Only used when the user has picked a `.pet(...)` cursor avatar style.
+    // Triangle styles ignore these.
+
+    /// High-level animation state fed to `OdysseusPetSpriteView`.
+    @State private var petAnimationState: OdysseusBuddyAnimationState = .idle
+
+    /// Last horizontal cursor position used to estimate running direction.
+    @State private var lastDirectionSampleX: CGFloat = 0
+    /// Wall-clock time of the last running-row update — drives a small dwell
+    /// hysteresis so tiny ↔ swap doesn't flip-flop the row every frame.
+    @State private var lastRunningRowFlipAt: Date = .distantPast
+
+    @AppStorage(OdysseusCursorAvatarStyle.userDefaultsKey)
+    private var avatarStyleRawValueForRotation = OdysseusCursorAvatarStyle.default.storageValue
+
+    private var currentCursorAvatarStyle: OdysseusCursorAvatarStyle {
+        OdysseusCursorAvatarStyle(storageValue: avatarStyleRawValueForRotation)
+    }
+
+    /// True when the active avatar is rotation-aware (triangles).
+    private var avatarHonorsRotation: Bool {
+        currentCursorAvatarStyle.honorsParentRotation
+    }
+
+    /// Keep glow for triangle cursors only; pet sprites should not glow.
+    private var shouldShowCursorGlow: Bool {
+        switch currentCursorAvatarStyle {
+        case .triangleFilled, .triangleOutline:
+            return true
+        case .pet:
+            return false
+        }
+    }
+
+    private var isCalibrationCursorBoxActive: Bool {
+        visualGuidanceOverlaysOnThisScreen.contains { overlay in
+            guard let caption = overlay.style.caption else { return false }
+            let normalized = caption
+                .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+                .lowercased()
+            return normalized.contains("calibration")
+                || normalized.contains("calibrate")
+                || normalized.contains("anchor")
+        }
+    }
+
+    /// Cursor samples already arrive at display cadence. Restarting a spring
+    /// on every sample looks playful on paper but creates visible lag and
+    /// extra SwiftUI work. Use a tiny linear interpolation while following the
+    /// real cursor, and disable implicit position animation during scripted
+    /// flights where the bezier timer owns each frame.
+    private var cursorFollowAnimation: Animation? {
+        buddyNavigationMode == .followingCursor ? .linear(duration: 1.0 / 120.0) : nil
+    }
+
+    private var normalizedCursorAvatarSizeScale: CGFloat {
+        CGFloat(
+            min(
+                max(cursorAvatarSizeScale, OdysseusCursorAvatarSizePreference.minScale),
+                OdysseusCursorAvatarSizePreference.maxScale
+            )
+        )
+    }
+
+    private let fullWelcomeMessage = "hey! i'm odysseus"
+    private var overlayCursorColor: Color {
+        (OdysseusAccentTheme(rawValue: selectedAccentThemeID) ?? .mint).cursorColor
+    }
+
+    private var captionBubbleBackgroundColor: Color { .white }
+    private var captionBubbleTextColor: Color { .black }
+    private var captionBubbleShadowColor: Color { Color.black.opacity(0.22) }
+    private var normalizedVoiceResponseCaptionOpacity: Double {
+        min(max(voiceResponseCaptionOpacity, 0.55), 1.0)
+    }
+
+    private let navigationPointerPhrases = [
+        "right here!",
+        "this one!",
+        "over here!",
+        "click this!",
+        "here it is!",
+        "found it!"
+    ]
+
+    var body: some View {
+        ZStack {
+            // Nearly transparent background (helps with compositing)
+            Color.black.opacity(0.001)
+
+            // Welcome speech bubble (first launch only)
+            if isCursorOnThisScreen && showWelcome && !welcomeText.isEmpty {
+                Text(welcomeText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(captionBubbleTextColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(captionBubbleBackgroundColor)
+                            .shadow(color: captionBubbleShadowColor, radius: 6, x: 0, y: 2)
+                    )
+                    .fixedSize()
+                    .overlay(
+                        GeometryReader { geo in
+                            Color.clear
+                                .preference(key: SizePreferenceKey.self, value: geo.size)
+                        }
+                    )
+                    .opacity(bubbleOpacity)
+                    .position(x: cursorPosition.x + 10 + (bubbleSize.width / 2), y: cursorPosition.y + 18)
+                    .animation(cursorFollowAnimation, value: cursorPosition)
+                    .animation(.easeOut(duration: 0.5), value: bubbleOpacity)
+                    .onPreferenceChange(SizePreferenceKey.self) { newSize in
+                        bubbleSize = newSize
+                    }
+            }
+
+            // Navigation pointer bubble — shown when buddy arrives at a detected element.
+            // Pops in with a scale-bounce (0.5x → 1.0x spring) and a bright initial
+            // glow that settles, creating a "materializing" effect.
+            if buddyNavigationMode == .pointingAtTarget && !navigationBubbleText.isEmpty {
+                Text(navigationBubbleText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(captionBubbleTextColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(captionBubbleBackgroundColor)
+                            .shadow(
+                                color: captionBubbleShadowColor.opacity(0.8 + (1.0 - navigationBubbleScale) * 0.2),
+                                radius: 6 + (1.0 - navigationBubbleScale) * 10,
+                                x: 0, y: 2
+                            )
+                    )
+                    .fixedSize()
+                    .overlay(
+                        GeometryReader { geo in
+                            Color.clear
+                                .preference(key: NavigationBubbleSizePreferenceKey.self, value: geo.size)
+                        }
+                    )
+                    .scaleEffect(navigationBubbleScale)
+                    .opacity(navigationBubbleOpacity)
+                    .position(x: cursorPosition.x + 10 + (navigationBubbleSize.width / 2), y: cursorPosition.y + 18)
+                    .animation(cursorFollowAnimation, value: cursorPosition)
+                    .animation(.spring(response: 0.4, dampingFraction: 0.6), value: navigationBubbleScale)
+                    .animation(.easeOut(duration: 0.5), value: navigationBubbleOpacity)
+                    .onPreferenceChange(NavigationBubbleSizePreferenceKey.self) { newSize in
+                        navigationBubbleSize = newSize
+                    }
+            }
+
+            if let externalPrimaryCaption = cursorState.externalPrimaryCaptionText?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !externalPrimaryCaption.isEmpty,
+               buddyIsVisibleOnThisScreen {
+                externalCaption(
+                    externalPrimaryCaption,
+                    at: cursorPosition,
+                    color: externalPrimaryCaptionColor
+                )
+            }
+
+            if let activeControlGlowRect = cursorState.activeControlGlowRect,
+               activeControlGlowRect.intersects(screenFrame) {
+                activeControlGlow(activeControlGlowRect)
+            }
+
+            ForEach(externalSecondaryCursorsOnThisScreen) { cursor in
+                externalSecondaryCursor(cursor)
+            }
+
+            ForEach(visualGuidanceOverlaysOnThisScreen) { overlay in
+                visualGuidanceOverlay(overlay)
+            }
+
+            if !circleSelectPointsOnThisScreen.isEmpty {
+                circleSelectLiveTrail(
+                    circleSelectPointsOnThisScreen,
+                    dimmed: cursorState.circleSelectSnappedRect != nil
+                )
+            }
+
+            if let snappedRect = cursorState.circleSelectSnappedRect,
+               snappedRect.intersects(screenFrame) {
+                circleSelectSnappedHighlight(
+                    snappedRect,
+                    label: cursorState.circleSelectSnapLabel
+                )
+            }
+
+            if shouldShowAgentTaskBubble,
+               let agentTaskBubbleText = cursorState.agentTaskBubbleText?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !agentTaskBubbleText.isEmpty {
+                let bubblePosition = anchoredBubblePosition(
+                    for: cursorPosition,
+                    bubbleSize: agentTaskBubbleSize,
+                    horizontalOffset: 12,
+                    verticalOffset: 20
+                )
+
+                Text(agentTaskBubbleText)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(captionBubbleTextColor)
+                    .lineLimit(3)
+                    .multilineTextAlignment(.leading)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(captionBubbleBackgroundColor)
+                            .shadow(color: captionBubbleShadowColor, radius: 8, x: 0, y: 2)
+                    )
+                    .frame(maxWidth: 300, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .overlay(
+                        GeometryReader { geo in
+                            Color.clear
+                                .preference(key: AgentTaskBubbleSizePreferenceKey.self, value: geo.size)
+                        }
+                    )
+                    .position(x: bubblePosition.x, y: bubblePosition.y)
+                    .opacity(cursorOpacity)
+                    .animation(cursorFollowAnimation, value: cursorPosition)
+                    .animation(.easeOut(duration: 0.16), value: cursorState.agentTaskBubbleText)
+                    .onPreferenceChange(AgentTaskBubbleSizePreferenceKey.self) { newSize in
+                        agentTaskBubbleSize = newSize
+                    }
+            }
+
+            // Cursor companion — shown when idle or while TTS is playing (responding).
+            // All three states (mascot, waveform, spinner) stay in the view tree
+            // permanently and cross-fade via opacity so SwiftUI doesn't remove/re-insert
+            // them (which caused a visible cursor "pop").
+            //
+            // During cursor following: fast spring animation for snappy tracking.
+            // During navigation: NO implicit animation — the frame-by-frame bezier
+            // timer controls position directly at 60fps for a smooth arc flight.
+            //
+            // Rotation is applied conditionally: triangle styles point in their
+            // direction of travel via rotation; pet sprites face up and use
+            // their own running-left/running-right rows for direction instead.
+            ZStack {
+                if isCalibrationCursorBoxActive {
+                    OdysseusCalibrationCursorBoxView(
+                        color: overlayCursorColor,
+                        reduceMotion: accessibilityReduceMotion
+                    )
+                } else {
+                    OdysseusCursorAvatarView(
+                        accentColor: overlayCursorColor,
+                        animationState: petAnimationState
+                    )
+                }
+            }
+                .frame(
+                    width: (isCalibrationCursorBoxActive ? 38 : (avatarHonorsRotation ? 25 : 48)) * normalizedCursorAvatarSizeScale,
+                    height: (isCalibrationCursorBoxActive ? 38 : (avatarHonorsRotation ? 33 : 52)) * normalizedCursorAvatarSizeScale
+                )
+                .rotationEffect(.degrees(!isCalibrationCursorBoxActive && avatarHonorsRotation ? buddyRotationDegrees : 0))
+                .shadow(
+                    color: (!isCalibrationCursorBoxActive && shouldShowCursorGlow) ? overlayCursorColor.opacity(0.86) : .clear,
+                    radius: (!isCalibrationCursorBoxActive && shouldShowCursorGlow) ? 8 + (buddyFlightScale - 1.0) * 20 : 0,
+                    x: 0,
+                    y: 0
+                )
+                .scaleEffect(buddyFlightScale)
+                .opacity(buddyIsVisibleOnThisScreen && (cursorState.voiceState == .idle || cursorState.voiceState == .responding) ? cursorOpacity : 0)
+                .position(cursorPosition)
+                .animation(
+                    buddyNavigationMode == .followingCursor
+                        ? .spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0)
+                        : nil,
+                    value: cursorPosition
+                )
+                .animation(.easeIn(duration: 0.25), value: cursorState.voiceState)
+                .animation(
+                    buddyNavigationMode == .navigatingToTarget ? nil : .easeInOut(duration: 0.3),
+                    value: buddyRotationDegrees
+                )
+                // Recompute pet row whenever ANY relevant input changes —
+                // covers navigation flights (cursorPosition is updated by
+                // the bezier timer, not the mouse tracker) and state-only
+                // transitions like processing or pointing.
+                .onChange(of: cursorPosition) { _, newPos in
+                    updatePetAnimationStateForCursorMotion(toX: newPos.x)
+                }
+                .onChange(of: buddyNavigationMode) { _, _ in
+                    updatePetAnimationStateForCursorMotion(toX: cursorPosition.x)
+                }
+                .onChange(of: cursorState.voiceState) { _, _ in
+                    updatePetAnimationStateForCursorMotion(toX: cursorPosition.x)
+                }
+
+            // Blue waveform — replaces the mascot while listening
+            BlueCursorWaveformView(
+                audioPowerLevel: cursorState.currentAudioPowerLevel,
+                cursorColor: overlayCursorColor,
+                isActive: buddyIsVisibleOnThisScreen && cursorState.voiceState == .listening
+            )
+                .opacity(buddyIsVisibleOnThisScreen && cursorState.voiceState == .listening ? cursorOpacity : 0)
+                .position(cursorPosition)
+                .animation(cursorFollowAnimation, value: cursorPosition)
+                .animation(.easeIn(duration: 0.15), value: cursorState.voiceState)
+
+            // Blue spinner — shown while the AI is processing (transcription + Claude + waiting for TTS)
+            BlueCursorSpinnerView(
+                cursorColor: overlayCursorColor,
+                isActive: buddyIsVisibleOnThisScreen && cursorState.voiceState == .processing
+            )
+                .opacity(buddyIsVisibleOnThisScreen && cursorState.voiceState == .processing ? cursorOpacity : 0)
+                .position(cursorPosition)
+                .animation(cursorFollowAnimation, value: cursorPosition)
+                .animation(.easeIn(duration: 0.15), value: cursorState.voiceState)
+
+        }
+        .frame(width: screenFrame.width, height: screenFrame.height)
+        .ignoresSafeArea()
+        .onAppear {
+            // Set initial cursor position immediately before starting animation
+            let mouseLocation = NSEvent.mouseLocation
+            isCursorOnThisScreen = screenFrame.contains(mouseLocation)
+
+            let swiftUIPosition = convertScreenPointToSwiftUICoordinates(mouseLocation)
+            self.cursorPosition = CGPoint(x: swiftUIPosition.x + 35, y: swiftUIPosition.y + 25)
+
+            startTrackingCursor()
+            DispatchQueue.main.async {
+                startNavigatingToCurrentDetectedLocationIfNeeded()
+            }
+
+            self.cursorOpacity = 1.0
+        }
+        .onDisappear {
+            welcomeTypingTimer?.invalidate()
+            cursorTrackingTimer?.cancel()
+            cursorTrackingTimer = nil
+            navigationAnimationTimer?.invalidate()
+            companionManager.tearDownOnboardingVideo()
+        }
+        .onChange(of: cursorState.detectedElementScreenLocation) { _, newLocation in
+            // When a UI element location is detected, navigate the buddy to
+            // that position so it points at the element. When the manager
+            // clears the target (for example after the agent dock spawns),
+            // force the buddy back into cursor-following mode. Without this,
+            // the view could remain in pointing mode until its delayed bubble
+            // timers fired, leaving Odysseus stuck in the top-right if the main
+            // actor was busy starting the agent.
+            guard newLocation != nil else {
+                resetNavigationStateAndResumeFollowing()
+                return
+            }
+            startNavigatingToCurrentDetectedLocationIfNeeded()
+        }
+    }
+
+    private func startNavigatingToCurrentDetectedLocationIfNeeded() {
+        guard let screenLocation = cursorState.detectedElementScreenLocation,
+              let displayFrame = cursorState.detectedElementDisplayFrame else {
+            return
+        }
+
+        // Only navigate if the target is on THIS screen. Use intersection as
+        // well as exact equality because NSScreen frame values can differ by
+        // tiny amounts across AppKit/SwiftUI conversions.
+        guard displayFrame.intersects(screenFrame) || screenFrame.contains(screenLocation) else {
+            return
+        }
+
+        startNavigatingToElement(screenLocation: screenLocation)
+    }
+
+    /// Whether the buddy mascot should be visible on this screen.
+    /// True when cursor is on this screen during normal following, or
+    /// when navigating/pointing at a target on this screen. When another
+    /// screen is navigating (detectedElementScreenLocation is set but this
+    /// screen isn't the one animating), hide the cursor so only one buddy
+    /// is ever visible at a time.
+    private var buddyIsVisibleOnThisScreen: Bool {
+        switch buddyNavigationMode {
+        case .followingCursor:
+            // If another screen's BlueCursorView is navigating to an element,
+            // hide the cursor on this screen to prevent a duplicate buddy
+            if cursorState.detectedElementScreenLocation != nil {
+                return false
+            }
+            return isCursorOnThisScreen
+        case .navigatingToTarget, .pointingAtTarget:
+            return true
+        }
+    }
+
+    private var shouldShowAgentTaskBubble: Bool {
+        buddyIsVisibleOnThisScreen
+            && buddyNavigationMode == .followingCursor
+            && !showWelcome
+            && cursorState.voiceState != .listening
+            && cursorState.voiceState != .processing
+    }
+
+    private var externalPrimaryCaptionColor: Color {
+        colorFromHex(cursorState.externalPrimaryCaptionAccentHex) ?? overlayCursorColor
+    }
+
+    private var externalSecondaryCursorsOnThisScreen: [OdysseusExternalProxyCursor] {
+        cursorState.externalSecondaryCursors.filter { cursor in
+            screenFrame.contains(cursor.screenLocation)
+        }
+    }
+
+    private var circleSelectPointsOnThisScreen: [CGPoint] {
+        let points = cursorState.circleSelectLivePoints
+        guard !points.isEmpty else { return [] }
+        return points.compactMap { point in
+            guard screenFrame.insetBy(dx: -40, dy: -40).contains(point) else { return nil }
+            return convertScreenPointToSwiftUICoordinates(point)
+        }
+    }
+
+    @ViewBuilder
+    private func circleSelectLiveTrail(_ localPoints: [CGPoint], dimmed: Bool) -> some View {
+        OdysseusFadingTrailView(
+            points: localPoints,
+            color: Color(red: 0.86, green: 0.28, blue: 0.24),
+            reduceMotion: accessibilityReduceMotion,
+            overallOpacity: dimmed ? 0.35 : 1.0
+        )
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    @ViewBuilder
+    private func circleSelectSnappedHighlight(_ screenRect: CGRect, label: String?) -> some View {
+        let localRect = convertScreenRectToSwiftUICoordinates(screenRect)
+        let trailColor = Color(red: 0.86, green: 0.28, blue: 0.24)
+        ZStack {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(trailColor.opacity(0.10))
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(trailColor.opacity(0.92), lineWidth: 2.4)
+                .shadow(color: trailColor.opacity(0.55), radius: 8, x: 0, y: 0)
+
+            if let label = label?.trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty {
+                Text(label)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(Color.black.opacity(0.72))
+                    )
+                    .position(x: localRect.midX, y: max(14, localRect.minY - 14))
+            }
+        }
+        .frame(width: max(1, localRect.width), height: max(1, localRect.height))
+        .position(x: localRect.midX, y: localRect.midY)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+        .animation(accessibilityReduceMotion ? nil : .easeOut(duration: 0.16), value: screenRect)
+    }
+
+    private var visualGuidanceOverlaysOnThisScreen: [OdysseusVisualGuidanceOverlay] {
+        cursorState.visualGuidanceOverlays.filter { overlay in
+            overlay.screenBounds.intersects(screenFrame)
+        }
+    }
+
+    private func activeControlGlow(_ screenRect: CGRect) -> some View {
+        let localRect = convertScreenRectToSwiftUICoordinates(screenRect)
+        return OdysseusActiveControlGlowView(
+            color: overlayCursorColor,
+            reduceMotion: accessibilityReduceMotion
+        )
+        .frame(width: max(1, localRect.width), height: max(1, localRect.height))
+        .position(x: localRect.midX, y: localRect.midY)
+        .transition(.opacity)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    @ViewBuilder
+    private func visualGuidanceOverlay(_ overlay: OdysseusVisualGuidanceOverlay) -> some View {
+        let color = colorFromHex(overlay.style.accentHex) ?? overlayCursorColor
+        ZStack {
+            switch overlay.kind {
+            case .scribble:
+                visualGuidanceScribble(overlay, color: color)
+            case .rectangle:
+                visualGuidanceRectangle(overlay, color: color)
+            }
+
+            if let caption = overlay.style.caption?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !caption.isEmpty {
+                externalCaption(caption, at: captionAnchor(for: overlay), color: color)
+            }
+        }
+        .transition(accessibilityReduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.98)))
+        .animation(accessibilityReduceMotion ? nil : .easeOut(duration: 0.18), value: overlay.id)
+        .allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private func visualGuidanceScribble(_ overlay: OdysseusVisualGuidanceOverlay, color: Color) -> some View {
+        let localPoints = overlay.points.map { convertScreenPointToSwiftUICoordinates($0.cgPoint) }
+        OdysseusVisualGuidanceScribbleView(
+            points: localPoints,
+            color: color,
+            lineWidth: CGFloat(overlay.style.lineWidth),
+            drawingDuration: min(1.2, max(0.35, overlay.duration * 0.20)),
+            reduceMotion: accessibilityReduceMotion
+        )
+    }
+
+    @ViewBuilder
+    private func visualGuidanceRectangle(_ overlay: OdysseusVisualGuidanceOverlay, color: Color) -> some View {
+        if let rect = overlay.rect?.normalized.cgRect {
+            let localRect = convertScreenRectToSwiftUICoordinates(rect)
+            OdysseusVisualGuidanceRectangleView(
+                color: color,
+                lineWidth: CGFloat(overlay.style.lineWidth),
+                fillOpacity: overlay.style.fillOpacity,
+                drawingDuration: min(0.95, max(0.38, overlay.duration * 0.22)),
+                reduceMotion: accessibilityReduceMotion
+            )
+            .frame(width: localRect.width, height: localRect.height)
+            .position(x: localRect.midX, y: localRect.midY)
+            .allowsHitTesting(false)
+        }
+    }
+
+    private func captionAnchor(for overlay: OdysseusVisualGuidanceOverlay) -> CGPoint {
+        let bounds = overlay.screenBounds
+        guard !bounds.isNull else { return cursorPosition }
+        return convertScreenPointToSwiftUICoordinates(CGPoint(x: bounds.midX, y: bounds.maxY))
+    }
+
+    private func convertScreenRectToSwiftUICoordinates(_ rect: CGRect) -> CGRect {
+        let topLeft = convertScreenPointToSwiftUICoordinates(CGPoint(x: rect.minX, y: rect.maxY))
+        return CGRect(x: topLeft.x, y: topLeft.y, width: rect.width, height: rect.height)
+    }
+
+    @ViewBuilder
+    private func externalSecondaryCursor(_ cursor: OdysseusExternalProxyCursor) -> some View {
+        let local = convertScreenPointToSwiftUICoordinates(cursor.screenLocation)
+        let position = CGPoint(x: local.x + 35, y: local.y + 25)
+        let color = colorFromHex(cursor.accentHex) ?? overlayCursorColor
+        ZStack {
+            OdysseusCursorAvatarView(accentColor: color, showsEyes: false)
+                .frame(width: 23, height: 30)
+                .rotationEffect(.degrees(triangleBaseRotationDegrees))
+                .shadow(color: color.opacity(0.90), radius: 10, x: 0, y: 0)
+                .position(position)
+                .transition(.opacity.combined(with: .scale(scale: 0.92)))
+
+            if let caption = cursor.caption?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !caption.isEmpty {
+                externalCaption(caption, at: position, color: color)
+            }
+        }
+        .animation(.spring(response: 0.16, dampingFraction: 0.72), value: cursor.screenLocation)
+    }
+
+    @ViewBuilder
+    private func externalCaption(_ caption: String, at position: CGPoint, color: Color) -> some View {
+        let providerBadge = companionManager.selectedVoiceBackendFamily?.displayName
+        let bubblePosition = anchoredBubblePosition(
+            for: position,
+            bubbleSize: estimatedExternalCaptionBubbleSize(for: caption, providerBadge: providerBadge),
+            horizontalOffset: 12,
+            verticalOffset: 20
+        )
+
+        VStack(alignment: .leading, spacing: 3) {
+            if let providerBadge {
+                Text(providerBadge)
+                    .font(.system(size: 8, weight: .heavy, design: .rounded))
+                    .foregroundColor(captionBubbleTextColor.opacity(0.55))
+                    .tracking(0.4)
+            }
+            Text(caption)
+                .font(OdysseusResponseCaptionFont.resolved(voiceResponseCaptionFontRawValue).swiftUIFont(size: 11, weight: .semibold))
+                .foregroundColor(captionBubbleTextColor)
+                .lineLimit(5)
+                .multilineTextAlignment(.leading)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(captionBubbleBackgroundColor.opacity(normalizedVoiceResponseCaptionOpacity))
+                .shadow(color: captionBubbleShadowColor.opacity(normalizedVoiceResponseCaptionOpacity), radius: 8, x: 0, y: 2)
+        )
+        .frame(maxWidth: 340, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
+        .position(x: bubblePosition.x, y: bubblePosition.y)
+        .transition(.opacity)
+        .transaction { transaction in
+            transaction.animation = nil
+        }
+    }
+
+    private func estimatedExternalCaptionBubbleSize(for caption: String, providerBadge: String? = nil) -> CGSize {
+        let trimmed = caption.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return CGSize(width: 72, height: 28) }
+
+        let averageGlyphWidth: CGFloat = 6.6
+        let horizontalPadding: CGFloat = 18
+        let maxWidth: CGFloat = 340
+        let minWidth: CGFloat = 72
+        let rawWidth = CGFloat(trimmed.count) * averageGlyphWidth + horizontalPadding
+        let width = min(max(rawWidth, minWidth), maxWidth)
+        let lineCount = max(1, Int(ceil(rawWidth / maxWidth)))
+        let badgeHeight: CGFloat = providerBadge == nil ? 0 : 12
+        let height = CGFloat(min(lineCount, 5)) * 15 + 10 + badgeHeight
+        return CGSize(width: width, height: height)
+    }
+
+    private func colorFromHex(_ rawHex: String?) -> Color? {
+        guard let hex = rawHex?.trimmingCharacters(in: .whitespacesAndNewlines), !hex.isEmpty else { return nil }
+        // H11: use the failable initializer so malformed/empty hex from model
+        // output or external cursor state returns nil, letting the caller's
+        // `?? overlayCursorColor` fallback actually engage (previously
+        // Color(hex:) silently returned black, making those fallbacks dead).
+        return Color(optionalHex: hex)
+    }
+
+    private func anchoredBubblePosition(
+        for cursorPosition: CGPoint,
+        bubbleSize: CGSize,
+        horizontalOffset: CGFloat,
+        verticalOffset: CGFloat
+    ) -> CGPoint {
+        let halfWidth = bubbleSize.width / 2
+        let halfHeight = bubbleSize.height / 2
+        let minMargin: CGFloat = 8
+
+        var x = cursorPosition.x + horizontalOffset + halfWidth
+        let maxX = screenFrame.width - halfWidth - minMargin
+        let minX = halfWidth + minMargin
+
+        if x > maxX {
+            x = cursorPosition.x - horizontalOffset - halfWidth
+        }
+        x = min(max(x, minX), maxX)
+
+        var y = cursorPosition.y + verticalOffset + halfHeight
+        let maxY = screenFrame.height - halfHeight - minMargin
+        let minY = halfHeight + minMargin
+        y = min(max(y, minY), maxY)
+
+        return CGPoint(x: x, y: y)
+    }
+
+    // MARK: - Cursor Tracking
+
+    private func startTrackingCursor() {
+        // Sample `NSEvent.mouseLocation` (thread-safe) on a high-priority
+        // background queue so cursor tracking is independent of main-actor
+        // pressure. Keep the producer off main, but coalesce delivery so a
+        // busy SwiftUI/TTS/agent-start moment cannot build a backlog of stale
+        // 60Hz cursor updates that replay as visible jank.
+        cursorTrackingTimer?.cancel()
+
+        let queue = DispatchQueue(label: "odysseus.cursor.tracker", qos: .userInteractive)
+        let dispatchTimer = DispatchSource.makeTimerSource(queue: queue)
+        dispatchTimer.schedule(deadline: .now(), repeating: .milliseconds(16), leeway: .milliseconds(3))
+        var lastSampledPoint: CGPoint = .zero
+        var updateQueuedOnMain = false
+
+        dispatchTimer.setEventHandler {
+            let mouseLocation = NSEvent.mouseLocation
+            guard mouseLocation != lastSampledPoint else { return }
+            lastSampledPoint = mouseLocation
+
+            guard !updateQueuedOnMain else { return }
+            updateQueuedOnMain = true
+
+            DispatchQueue.main.async {
+                updateCursorTracking()
+                queue.async {
+                    updateQueuedOnMain = false
+                }
+            }
+        }
+        dispatchTimer.resume()
+        cursorTrackingTimer = dispatchTimer
+    }
+
+    private func updateCursorTracking() {
+        // H9: skip the cursor-tracking work when the buddy is hidden on this
+        // screen, so a multi-display setup doesn't pay for per-frame state
+        // writes that produce no visible pixels. Checked here on the main
+        // thread (not in the background timer handler) because this struct's
+        // @State-backed `buddyIsVisibleOnThisScreen` must be read via SwiftUI's
+        // live indirection — capturing `self` in the background closure would
+        // snapshot stale state, and `[weak self]` is illegal on a value type.
+        guard buddyIsVisibleOnThisScreen else { return }
+        let mouseLocation = NSEvent.mouseLocation
+        isCursorOnThisScreen = screenFrame.contains(mouseLocation)
+
+        // During forward flight or pointing, the buddy is NOT interrupted by
+        // mouse movement — it completes its full animation and return flight.
+        // Only during the RETURN flight do we allow cursor movement to cancel
+        // (so the buddy snaps to following if the user moves while it's flying back).
+        if buddyNavigationMode == .navigatingToTarget && isReturningToCursor {
+            let currentMouseInSwiftUI = convertScreenPointToSwiftUICoordinates(mouseLocation)
+            let distanceFromNavigationStart = hypot(
+                currentMouseInSwiftUI.x - cursorPositionWhenNavigationStarted.x,
+                currentMouseInSwiftUI.y - cursorPositionWhenNavigationStarted.y
+            )
+            if distanceFromNavigationStart > 100 {
+                cancelNavigationAndResumeFollowing()
+            }
+            return
+        }
+
+        // During forward navigation or pointing, just skip cursor tracking
+        if buddyNavigationMode != .followingCursor {
+            return
+        }
+
+        // Normal cursor following
+        let swiftUIPosition = convertScreenPointToSwiftUICoordinates(mouseLocation)
+        let buddyX = swiftUIPosition.x + 35
+        let buddyY = swiftUIPosition.y + 25
+        cursorPosition = CGPoint(x: buddyX, y: buddyY)
+
+        updatePetAnimationStateForCursorMotion(toX: buddyX)
+    }
+
+    // MARK: - Pet animation state derivation
+
+    /// Translates the buddy's full state (voice, navigation, cursor motion)
+    /// into the right atlas row for the pet sprite. Called on every cursor
+    /// position change AND on every navigation/voice state change so the
+    /// pet stays in sync regardless of who's driving the position update
+    /// (mouse tracker vs. bezier-flight timer).
+    private func updatePetAnimationStateForCursorMotion(toX newX: CGFloat) {
+        // Skip work entirely when the active avatar isn't a pet — the
+        // triangle styles ignore animation state.
+        guard !avatarHonorsRotation else { return }
+
+        // Highest priority: thinking spinner shouldn't show running cycles.
+        if cursorState.voiceState == .processing {
+            setPetAnimationState(.review)
+            lastDirectionSampleX = newX
+            return
+        }
+        // Pointing-at-target is a stationary pose — wave at the target.
+        if buddyNavigationMode == .pointingAtTarget {
+            setPetAnimationState(.waving)
+            lastDirectionSampleX = newX
+            return
+        }
+
+        // Velocity drives direction whether we're following the cursor OR
+        // flying along a bezier arc — both update `cursorPosition`. During
+        // navigation the bezier timer ticks at 60fps so dx stays meaningful.
+        let dx = newX - lastDirectionSampleX
+        let now = Date()
+        let deadZone: CGFloat = 1.5
+        let minDwell: TimeInterval = 0.08
+        let isFlying = buddyNavigationMode == .navigatingToTarget
+
+        if abs(dx) < deadZone {
+            // Mid-flight with no horizontal component (vertical arc, or
+            // crest of the curve where dx briefly approaches 0) — fall back
+            // to the generic running row so the sprite keeps looking active.
+            if isFlying {
+                if petAnimationState != .running {
+                    setPetAnimationState(.running)
+                }
+            } else if now.timeIntervalSince(lastRunningRowFlipAt) > 0.6 {
+                // Following cursor and cursor has been still for >0.6s.
+                setPetAnimationState(.idle)
+            }
+        } else {
+            let desired: OdysseusBuddyAnimationState = dx > 0 ? .runningRight : .runningLeft
+            if desired != petAnimationState,
+               now.timeIntervalSince(lastRunningRowFlipAt) > minDwell {
+                setPetAnimationState(desired)
+                lastRunningRowFlipAt = now
+            }
+        }
+        lastDirectionSampleX = newX
+    }
+
+    private func setPetAnimationState(_ next: OdysseusBuddyAnimationState) {
+        if petAnimationState != next {
+            petAnimationState = next
+        }
+    }
+
+    /// Converts a macOS screen point (AppKit, bottom-left origin) to SwiftUI
+    /// coordinates (top-left origin) relative to this screen's overlay window.
+    private func convertScreenPointToSwiftUICoordinates(_ screenPoint: CGPoint) -> CGPoint {
+        let x = screenPoint.x - screenFrame.origin.x
+        let y = (screenFrame.origin.y + screenFrame.height) - screenPoint.y
+        return CGPoint(x: x, y: y)
+    }
+
+    // MARK: - Element Navigation
+
+    /// Starts animating the buddy toward a detected UI element location.
+    private func startNavigatingToElement(screenLocation: CGPoint) {
+        // Don't interrupt welcome animation
+        guard !showWelcome || welcomeText.isEmpty else { return }
+
+        // Convert the AppKit screen location to SwiftUI coordinates for this screen
+        let targetInSwiftUI = convertScreenPointToSwiftUICoordinates(screenLocation)
+
+        // Offset the target so the buddy sits beside the element rather than
+        // directly on top of it — 8px to the right, 12px below.
+        let offsetTarget = CGPoint(
+            x: targetInSwiftUI.x + 8,
+            y: targetInSwiftUI.y + 12
+        )
+
+        // Clamp target to screen bounds with padding
+        let clampedTarget = CGPoint(
+            x: max(20, min(offsetTarget.x, screenFrame.width - 20)),
+            y: max(20, min(offsetTarget.y, screenFrame.height - 20))
+        )
+
+        // Record the current cursor position so we can detect if the user
+        // moves the mouse enough to cancel the return flight
+        let mouseLocation = NSEvent.mouseLocation
+        cursorPositionWhenNavigationStarted = convertScreenPointToSwiftUICoordinates(mouseLocation)
+
+        // Enter navigation mode — stop cursor following
+        buddyNavigationMode = .navigatingToTarget
+        isReturningToCursor = false
+
+        animateBezierFlightArc(to: clampedTarget) {
+            guard self.buddyNavigationMode == .navigatingToTarget else { return }
+            self.startPointingAtElement()
+        }
+    }
+
+    /// Animates the buddy along a quadratic bezier arc from its current position
+    /// to the specified destination. The mascot tilts toward its direction
+    /// of travel (tangent to the curve) each frame, scales up at the midpoint
+    /// for a "swooping" feel, and the glow intensifies during flight.
+    private func animateBezierFlightArc(
+        to destination: CGPoint,
+        onComplete: @escaping () -> Void
+    ) {
+        navigationAnimationTimer?.invalidate()
+
+        let startPosition = cursorPosition
+        let endPosition = destination
+
+        let deltaX = endPosition.x - startPosition.x
+        let deltaY = endPosition.y - startPosition.y
+        let distance = hypot(deltaX, deltaY)
+
+        // Flight duration scales with distance. Normal pointing flights stay
+        // a little theatrical; agent-start corner handoffs should still feel
+        // quick, but not so quick that the rendered buddy appears to turn back
+        // before it actually reaches the parked-agent area.
+        let flightDurationSeconds: Double
+        if cursorState.detectedElementReturnsImmediately {
+            flightDurationSeconds = min(max(distance / 1800.0, 0.32), 0.58)
+        } else {
+            flightDurationSeconds = min(max(distance / 800.0, 0.6), 1.4)
+        }
+        let frameInterval: Double = 1.0 / 60.0
+        let totalFrames = Int(flightDurationSeconds / frameInterval)
+        var currentFrame = 0
+
+        // Control point for the quadratic bezier arc. Offset the midpoint
+        // upward (negative Y in SwiftUI) so the buddy flies in a parabolic arc.
+        let midPoint = CGPoint(
+            x: (startPosition.x + endPosition.x) / 2.0,
+            y: (startPosition.y + endPosition.y) / 2.0
+        )
+        let arcHeight = min(distance * 0.2, 80.0)
+        let controlPoint = CGPoint(x: midPoint.x, y: midPoint.y - arcHeight)
+
+        let animationTimer = Timer(timeInterval: frameInterval, repeats: true) { _ in
+            currentFrame += 1
+
+            if currentFrame > totalFrames {
+                self.navigationAnimationTimer?.invalidate()
+                self.navigationAnimationTimer = nil
+                self.cursorPosition = endPosition
+                self.buddyFlightScale = 1.0
+                onComplete()
+                return
+            }
+
+            // Linear progress 0→1 over the flight duration
+            let linearProgress = Double(currentFrame) / Double(totalFrames)
+
+            // Smoothstep easeInOut: 3t² - 2t³ (Hermite interpolation)
+            let t = linearProgress * linearProgress * (3.0 - 2.0 * linearProgress)
+
+            // Quadratic bezier: B(t) = (1-t)²·P0 + 2(1-t)t·P1 + t²·P2
+            let oneMinusT = 1.0 - t
+            let bezierX = oneMinusT * oneMinusT * startPosition.x
+                        + 2.0 * oneMinusT * t * controlPoint.x
+                        + t * t * endPosition.x
+            let bezierY = oneMinusT * oneMinusT * startPosition.y
+                        + 2.0 * oneMinusT * t * controlPoint.y
+                        + t * t * endPosition.y
+
+            self.cursorPosition = CGPoint(x: bezierX, y: bezierY)
+
+            // Rotation: face the direction of travel by computing the tangent
+            // to the bezier curve. B'(t) = 2(1-t)(P1-P0) + 2t(P2-P1)
+            let tangentX = 2.0 * oneMinusT * (controlPoint.x - startPosition.x)
+                         + 2.0 * t * (endPosition.x - controlPoint.x)
+            let tangentY = 2.0 * oneMinusT * (controlPoint.y - startPosition.y)
+                         + 2.0 * t * (endPosition.y - controlPoint.y)
+            // A small offset makes the paperclip lean into rightward movement
+            // instead of standing straight up during flight.
+            self.buddyRotationDegrees = atan2(tangentY, tangentX) * (180.0 / .pi) + 28.0
+
+            // Scale pulse: sin curve peaks at midpoint of the flight.
+            // Buddy grows to ~1.3x at the apex, then shrinks back to 1.0x on landing.
+            let scalePulse = sin(linearProgress * .pi)
+            self.buddyFlightScale = 1.0 + scalePulse * 0.3
+        }
+        navigationAnimationTimer = animationTimer
+        RunLoop.main.add(animationTimer, forMode: .common)
+    }
+
+    /// Transitions to pointing mode — shows a speech bubble with a bouncy
+    /// scale-in entrance and variable-speed character streaming. Agent-start
+    /// handoffs skip the bubble, settle briefly at the dock point, then return
+    /// so Odysseus visibly reaches the parking area before flying back.
+    private func startPointingAtElement() {
+        buddyNavigationMode = .pointingAtTarget
+
+        // Rotate back to default angle now that we've arrived
+        buddyRotationDegrees = triangleBaseRotationDegrees
+
+        // Reset navigation bubble state — start small for the scale-bounce entrance
+        navigationBubbleText = ""
+        navigationBubbleOpacity = 1.0
+        navigationBubbleSize = .zero
+        navigationBubbleScale = 0.5
+
+        if cursorState.detectedElementReturnsImmediately {
+            navigationBubbleOpacity = 0.0
+            navigationBubbleScale = 1.0
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) {
+                guard self.buddyNavigationMode == .pointingAtTarget else { return }
+                self.startFlyingBackToCursor()
+            }
+            return
+        }
+
+        // Use custom bubble text from the companion manager (e.g. onboarding demo)
+        // if available, otherwise fall back to a random pointer phrase
+        let pointerPhrase = cursorState.detectedElementBubbleText
+            ?? navigationPointerPhrases.randomElement()
+            ?? "right here!"
+
+        streamNavigationBubbleCharacter(phrase: pointerPhrase, characterIndex: 0) {
+            // All characters streamed — hold for 3 seconds, then fly back
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                guard self.buddyNavigationMode == .pointingAtTarget else { return }
+                self.navigationBubbleOpacity = 0.0
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    guard self.buddyNavigationMode == .pointingAtTarget else { return }
+                    self.startFlyingBackToCursor()
+                }
+            }
+        }
+    }
+
+    /// Streams the navigation bubble text one character at a time with variable
+    /// delays (30–60ms) for a natural "speaking" rhythm.
+    private func streamNavigationBubbleCharacter(
+        phrase: String,
+        characterIndex: Int,
+        onComplete: @escaping () -> Void
+    ) {
+        guard buddyNavigationMode == .pointingAtTarget else { return }
+        guard characterIndex < phrase.count else {
+            onComplete()
+            return
+        }
+
+        let charIndex = phrase.index(phrase.startIndex, offsetBy: characterIndex)
+        navigationBubbleText.append(phrase[charIndex])
+
+        // On the first character, trigger the scale-bounce entrance
+        if characterIndex == 0 {
+            navigationBubbleScale = 1.0
+        }
+
+        let characterDelay = Double.random(in: 0.03...0.06)
+        DispatchQueue.main.asyncAfter(deadline: .now() + characterDelay) {
+            self.streamNavigationBubbleCharacter(
+                phrase: phrase,
+                characterIndex: characterIndex + 1,
+                onComplete: onComplete
+            )
+        }
+    }
+
+    /// Flies the buddy back to the current cursor position after pointing is done.
+    private func startFlyingBackToCursor() {
+        let mouseLocation = NSEvent.mouseLocation
+        let cursorInSwiftUI = convertScreenPointToSwiftUICoordinates(mouseLocation)
+        let cursorWithTrackingOffset = CGPoint(x: cursorInSwiftUI.x + 35, y: cursorInSwiftUI.y + 25)
+
+        cursorPositionWhenNavigationStarted = cursorInSwiftUI
+
+        buddyNavigationMode = .navigatingToTarget
+        isReturningToCursor = true
+
+        animateBezierFlightArc(to: cursorWithTrackingOffset) {
+            self.finishNavigationAndResumeFollowing()
+        }
+    }
+
+    /// Cancels an in-progress navigation because the user moved the cursor.
+    private func cancelNavigationAndResumeFollowing() {
+        navigationAnimationTimer?.invalidate()
+        navigationAnimationTimer = nil
+        navigationBubbleText = ""
+        navigationBubbleOpacity = 0.0
+        navigationBubbleScale = 1.0
+        buddyFlightScale = 1.0
+        finishNavigationAndResumeFollowing()
+    }
+
+    /// Returns the buddy to normal cursor-following mode after navigation completes.
+    private func finishNavigationAndResumeFollowing() {
+        resetNavigationStateAndResumeFollowing()
+        companionManager.clearDetectedElementLocation()
+    }
+
+    private func resetNavigationStateAndResumeFollowing() {
+        navigationAnimationTimer?.invalidate()
+        navigationAnimationTimer = nil
+        buddyNavigationMode = .followingCursor
+        isReturningToCursor = false
+        buddyRotationDegrees = 2.0
+        buddyFlightScale = 1.0
+        navigationBubbleText = ""
+        navigationBubbleOpacity = 0.0
+        navigationBubbleScale = 1.0
+        updateCursorTracking()
+    }
+
+    // MARK: - Welcome Animation
+
+    private func startWelcomeAnimation() {
+        withAnimation(.easeIn(duration: 0.4)) {
+            self.bubbleOpacity = 1.0
+        }
+
+        var currentIndex = 0
+        // H8: capture the timer into @State (`welcomeTypingTimer`) so onDisappear
+        // can invalidate it. Previously the timer was a local (its `timer` param
+        // shadowed the dead @State `timer`), so an overlay disappear mid-typing
+        // left it firing against recycled state. BlueCursorView is a SwiftUI
+        // struct, so there is no retain cycle to guard against — capture `self`
+        // by value; @State writes go through SwiftUI's live backing storage.
+        let typingTimer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { timer in
+            guard currentIndex < fullWelcomeMessage.count else {
+                timer.invalidate()
+                welcomeTypingTimer = nil
+                // Hold the text for 2 seconds, then fade it out
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    bubbleOpacity = 0.0
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                    showWelcome = false
+                }
+                return
+            }
+
+            let index = fullWelcomeMessage.index(fullWelcomeMessage.startIndex, offsetBy: currentIndex)
+            welcomeText.append(fullWelcomeMessage[index])
+            currentIndex += 1
+        }
+        welcomeTypingTimer = typingTimer
+    }
+}
+
+private struct OdysseusActiveControlGlowView: View {
+    let color: Color
+    let reduceMotion: Bool
+
+    @State private var pulse = false
+
+    var body: some View {
+        GeometryReader { geometry in
+            let radius = min(max(min(geometry.size.width, geometry.size.height) * 0.05, 10), 30)
+            ZStack {
+                ForEach(0..<5, id: \.self) { index in
+                    let inset = CGFloat(index) * 5
+                    RoundedRectangle(cornerRadius: max(2, radius - inset * 0.35), style: .continuous)
+                        .inset(by: inset)
+                        .strokeBorder(
+                            color.opacity(glowOpacity(for: index)),
+                            lineWidth: CGFloat(5 - index)
+                        )
+                }
+
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .strokeBorder(color.opacity(0.78), lineWidth: 1.4)
+            }
+            .blur(radius: reduceMotion ? 0.2 : (pulse ? 0.45 : 0.9))
+            .opacity(reduceMotion ? 0.82 : (pulse ? 0.92 : 0.68))
+            .compositingGroup()
+            .onAppear {
+                pulse = true
+            }
+            .animation(
+                reduceMotion ? nil : .easeInOut(duration: 0.75).repeatForever(autoreverses: true),
+                value: pulse
+            )
+        }
+    }
+
+    private func glowOpacity(for index: Int) -> Double {
+        let opacities = [0.55, 0.32, 0.20, 0.13, 0.08]
+        return opacities[min(max(index, 0), opacities.count - 1)]
+    }
+}
+
+private struct OdysseusVisualGuidanceScribbleView: View {
+    let points: [CGPoint]
+    let color: Color
+    let lineWidth: CGFloat
+    let drawingDuration: TimeInterval
+    let reduceMotion: Bool
+
+    @State private var drawProgress: CGFloat = 0
+
+    var body: some View {
+        let clampedProgress = min(max(drawProgress, 0), 1)
+
+        ZStack(alignment: .topLeading) {
+            OdysseusSmoothScribblePath(points: points)
+                .trim(from: 0, to: clampedProgress)
+                .stroke(
+                    color,
+                    style: StrokeStyle(
+                        lineWidth: lineWidth,
+                        lineCap: .round,
+                        lineJoin: .round
+                    )
+                )
+                .shadow(
+                    color: color.opacity(reduceMotion ? 0.30 : 0.68),
+                    radius: reduceMotion ? 2 : 7,
+                    x: 0,
+                    y: 0
+                )
+
+            if !reduceMotion,
+               let cursorPoint = OdysseusSmoothScribblePath.point(on: points, progress: clampedProgress),
+               clampedProgress < 0.995 {
+                OdysseusCursorAvatarView(accentColor: color)
+                    .frame(width: 18, height: 24)
+                    .rotationEffect(.degrees(12))
+                    .shadow(color: color.opacity(0.65), radius: 6, x: 0, y: 0)
+                    .position(cursorPoint)
+            }
+        }
+        .onAppear {
+            drawProgress = reduceMotion ? 1 : 0
+            guard !reduceMotion else { return }
+            withAnimation(.easeInOut(duration: drawingDuration)) {
+                drawProgress = 1
+            }
+        }
+    }
+}
+
+/// Freehand circle-select stroke: smooth path with a comet-style fading tail
+/// (oldest segments nearly invisible, head bright and slightly thicker).
+private struct OdysseusFadingTrailView: View {
+    let points: [CGPoint]
+    let color: Color
+    let reduceMotion: Bool
+    var overallOpacity: Double = 1.0
+
+    /// How many point-steps make up each fade band. Smaller = smoother fade.
+    private let pointsPerBand = 3
+    private let minOpacity: Double = 0.08
+    private let maxOpacity: Double = 0.95
+    private let minLineWidth: CGFloat = 2.2
+    private let maxLineWidth: CGFloat = 5.0
+
+    var body: some View {
+        let displayPoints = points.count >= 2 ? points : []
+        ZStack(alignment: .topLeading) {
+            if displayPoints.count >= 2 {
+                ForEach(Array(bandRanges(for: displayPoints.count).enumerated()), id: \.offset) { _, range in
+                    let progress = bandProgress(range: range, total: displayPoints.count)
+                    let opacity = (minOpacity + (maxOpacity - minOpacity) * progress) * overallOpacity
+                    let width = minLineWidth + (maxLineWidth - minLineWidth) * CGFloat(progress)
+                    let slice = Array(displayPoints[range])
+                    OdysseusSmoothScribblePath(points: slice)
+                        .stroke(
+                            color.opacity(opacity),
+                            style: StrokeStyle(lineWidth: width, lineCap: .round, lineJoin: .round)
+                        )
+                        .shadow(
+                            color: color.opacity(reduceMotion ? opacity * 0.15 : opacity * 0.55),
+                            radius: reduceMotion ? 1.5 : (2.5 + 4.5 * progress),
+                            x: 0,
+                            y: 0
+                        )
+                }
+            }
+
+            if let last = displayPoints.last, overallOpacity > 0.5 {
+                Circle()
+                    .fill(color.opacity(0.95 * overallOpacity))
+                    .frame(width: 8, height: 8)
+                    .shadow(color: color.opacity(0.75 * overallOpacity), radius: 5, x: 0, y: 0)
+                    .position(last)
+            }
+        }
+        .opacity(overallOpacity)
+    }
+
+    /// Overlapping index ranges so band strokes join without gaps.
+    private func bandRanges(for count: Int) -> [Range<Int>] {
+        guard count >= 2 else { return [] }
+        var ranges: [Range<Int>] = []
+        var start = 0
+        while start < count - 1 {
+            let end = min(count, start + pointsPerBand + 1)
+            ranges.append(start..<end)
+            if end >= count { break }
+            // Overlap one point so adjacent bands share a join vertex.
+            start = end - 1
+        }
+        return ranges
+    }
+
+    /// 0 at the oldest end of the stroke, 1 at the newest (head).
+    private func bandProgress(range: Range<Int>, total: Int) -> Double {
+        guard total > 1 else { return 1 }
+        let mid = Double(range.lowerBound + range.upperBound - 1) / 2.0
+        return min(max(mid / Double(total - 1), 0), 1)
+    }
+}
+
+private struct OdysseusSmoothScribblePath: Shape {
+    let points: [CGPoint]
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        guard let first = points.first else { return path }
+        path.move(to: first)
+
+        guard points.count > 2 else {
+            if let last = points.last {
+                path.addLine(to: last)
+            }
+            return path
+        }
+
+        for index in 1..<points.count {
+            let current = points[index]
+            if index < points.count - 1 {
+                let next = points[index + 1]
+                let midpoint = CGPoint(
+                    x: (current.x + next.x) / 2,
+                    y: (current.y + next.y) / 2
+                )
+                path.addQuadCurve(to: midpoint, control: current)
+            } else {
+                path.addQuadCurve(to: current, control: current)
+            }
+        }
+
+        return path
+    }
+
+    static func point(on points: [CGPoint], progress: CGFloat) -> CGPoint? {
+        guard let first = points.first else { return nil }
+        guard points.count > 1 else { return first }
+
+        let segments = zip(points, points.dropFirst()).map { pair in
+            let start = pair.0
+            let end = pair.1
+            let dx = end.x - start.x
+            let dy = end.y - start.y
+            return (start: start, end: end, length: (dx * dx + dy * dy).squareRoot())
+        }
+        let totalLength = segments.reduce(CGFloat(0)) { $0 + $1.length }
+        guard totalLength > 0 else { return first }
+
+        var remaining = min(max(progress, 0), 1) * totalLength
+        for segment in segments {
+            guard segment.length > 0 else { continue }
+            if remaining <= segment.length {
+                let t = remaining / segment.length
+                return CGPoint(
+                    x: segment.start.x + (segment.end.x - segment.start.x) * t,
+                    y: segment.start.y + (segment.end.y - segment.start.y) * t
+                )
+            }
+            remaining -= segment.length
+        }
+
+        return points.last
+    }
+}
+
+private struct OdysseusVisualGuidanceRectangleView: View {
+    let color: Color
+    let lineWidth: CGFloat
+    let fillOpacity: Double
+    let drawingDuration: TimeInterval
+    let reduceMotion: Bool
+
+    @State private var drawProgress: CGFloat = 0
+
+    var body: some View {
+        GeometryReader { geometry in
+            let size = geometry.size
+            let clampedProgress = min(max(drawProgress, 0), 1)
+
+            ZStack(alignment: .topLeading) {
+                Rectangle()
+                    .fill(color.opacity(fillOpacity * Double(clampedProgress)))
+
+                OdysseusTopLeftRectangleOutline()
+                    .trim(from: 0, to: clampedProgress)
+                    .stroke(
+                        color,
+                        style: StrokeStyle(
+                            lineWidth: lineWidth,
+                            lineCap: .round,
+                            lineJoin: .round,
+                            dash: [lineWidth * 2.4, lineWidth * 1.7]
+                        )
+                    )
+                    .shadow(
+                        color: color.opacity(reduceMotion ? 0.30 : 0.70),
+                        radius: reduceMotion ? 2 : 9,
+                        x: 0,
+                        y: 0
+                    )
+
+                if !reduceMotion && clampedProgress < 0.995 {
+                    OdysseusCursorAvatarView(accentColor: color)
+                        .frame(width: 18, height: 24)
+                        .rotationEffect(.degrees(12))
+                        .shadow(color: color.opacity(0.65), radius: 6, x: 0, y: 0)
+                        .position(
+                            x: max(0, min(size.width, size.width * clampedProgress)),
+                            y: max(0, min(size.height, size.height * clampedProgress))
+                        )
+                }
+            }
+            .onAppear {
+                drawProgress = reduceMotion ? 1 : 0
+                guard !reduceMotion else { return }
+                withAnimation(.easeOut(duration: drawingDuration)) {
+                    drawProgress = 1
+                }
+            }
+            .onChange(of: geometry.size) { _, _ in
+                if reduceMotion {
+                    drawProgress = 1
+                }
+            }
+        }
+    }
+}
+
+private struct OdysseusTopLeftRectangleOutline: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
+        return path
+    }
+}
+
+// MARK: - Blue Cursor Waveform
+
+/// A small blue waveform that replaces the cursor companion while
+/// the user is holding the push-to-talk shortcut and speaking.
+private struct BlueCursorWaveformView: View {
+    let audioPowerLevel: CGFloat
+    let cursorColor: Color
+    let isActive: Bool
+
+    private let barCount = 5
+    private let listeningBarProfile: [CGFloat] = [0.4, 0.7, 1.0, 0.7, 0.4]
+
+    @ViewBuilder
+    var body: some View {
+        if isActive {
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timelineContext in
+                bars(timelineDate: timelineContext.date)
+            }
+        } else {
+            bars(timelineDate: .distantPast)
+        }
+    }
+
+    private func bars(timelineDate: Date) -> some View {
+        HStack(alignment: .center, spacing: 2) {
+            ForEach(0..<barCount, id: \.self) { barIndex in
+                RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                    .fill(cursorColor)
+                    .frame(
+                        width: 2,
+                        height: barHeight(
+                            for: barIndex,
+                            timelineDate: timelineDate
+                        )
+                    )
+            }
+        }
+        .shadow(color: cursorColor.opacity(0.6), radius: 6, x: 0, y: 0)
+    }
+
+    private func barHeight(for barIndex: Int, timelineDate: Date) -> CGFloat {
+        let animationPhase = CGFloat(timelineDate.timeIntervalSinceReferenceDate * 3.6) + CGFloat(barIndex) * 0.35
+        let normalizedAudioPowerLevel = max(audioPowerLevel - 0.008, 0)
+        let easedAudioPowerLevel = pow(min(normalizedAudioPowerLevel * 2.85, 1), 0.76)
+        let reactiveHeight = easedAudioPowerLevel * 10 * listeningBarProfile[barIndex]
+        let idlePulse = (sin(animationPhase) + 1) / 2 * 1.5
+        return 3 + reactiveHeight + idlePulse
+    }
+}
+
+// MARK: - Blue Cursor Spinner
+
+/// A small blue spinning indicator that replaces the cursor companion
+/// while the AI is processing a voice input.
+private struct BlueCursorSpinnerView: View {
+    let cursorColor: Color
+    let isActive: Bool
+    @State private var isSpinning = false
+
+    var body: some View {
+        Circle()
+            .trim(from: 0.15, to: 0.85)
+            .stroke(
+                AngularGradient(
+                    colors: [
+                        cursorColor.opacity(0.0),
+                        cursorColor
+                    ],
+                    center: .center
+                ),
+                style: StrokeStyle(lineWidth: 2.5, lineCap: .round)
+            )
+            .frame(width: 14, height: 14)
+            .rotationEffect(.degrees(isSpinning && isActive ? 360 : 0))
+            .shadow(color: cursorColor.opacity(0.6), radius: 6, x: 0, y: 0)
+            .onAppear {
+                updateSpinning()
+            }
+            .onChange(of: isActive) { _, _ in
+                updateSpinning()
+            }
+    }
+
+    private func updateSpinning() {
+        if isActive {
+            isSpinning = false
+            withAnimation(.linear(duration: 0.8).repeatForever(autoreverses: false)) {
+                isSpinning = true
+            }
+        } else {
+            withAnimation(nil) {
+                isSpinning = false
+            }
+        }
+    }
+}
+
+private final class OdysseusAgentDockLayoutState: ObservableObject {
+    var opensPanelsToRight = false {
+        didSet { scheduleChangeNotification() }
+    }
+    var dockHeight: CGFloat = 540 {
+        didSet { scheduleChangeNotification() }
+    }
+
+    private var hasPendingChangeNotification = false
+
+    private func scheduleChangeNotification() {
+        guard !hasPendingChangeNotification else { return }
+        hasPendingChangeNotification = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.hasPendingChangeNotification = false
+            self.objectWillChange.send()
+        }
+    }
+}
+
+private struct OdysseusAgentDockStackView: View {
+    @ObservedObject var companionManager: CompanionManager
+    @ObservedObject var layoutState: OdysseusAgentDockLayoutState
+    @State private var hoveredItemID: UUID?
+    @State private var pendingHoverExit: DispatchWorkItem?
+    @State private var didDragDock = false
+    @State private var manuallyClosedExpandedItemIDs: Set<UUID> = []
+    private let dockItemSlotSize: CGFloat = 78
+    private let dockItemSpacing: CGFloat = 12
+    private let hoverCardHeight: CGFloat = 236
+    private let hoverExitGraceDelay: TimeInterval = 0.42
+    private let terminalHoverExitGraceDelay: TimeInterval = 1.20
+    // Leave generous transparent overdraw room above the first parked avatar.
+    // The avatar glow/status pulse intentionally paints outside the 52pt
+    // circle; without this inset, the panel can crop the first parked task
+    // when the dock is parked near the screen edge.
+    private let avatarTopOverdrawPadding: CGFloat = 54
+
+    var body: some View {
+        ZStack(alignment: layoutState.opensPanelsToRight ? .topLeading : .topTrailing) {
+            ForEach(Array(companionManager.agentDockItems.enumerated()), id: \.element.id) { index, item in
+                dockRow(for: item)
+                    .offset(y: rowOffset(for: index))
+                    // Keep every parked avatar above the currently-expanded
+                    // card's tall hover row so moving down the avatar stack
+                    // immediately swaps the panel to the item under the
+                    // cursor instead of being intercepted by the old card.
+                    .zIndex(shouldShowExpandedCard(for: item) ? 1 : 2)
+            }
+        }
+        .frame(width: 760, height: stackHeight, alignment: layoutState.opensPanelsToRight ? .topLeading : .topTrailing)
+        .padding(layoutState.opensPanelsToRight ? .leading : .trailing, 4)
+        .animation(.easeOut(duration: 0.16), value: companionManager.agentDockItems)
+    }
+
+    private var stackHeight: CGFloat {
+        max(layoutState.dockHeight - 40, requiredStackHeight)
+    }
+
+    private var requiredStackHeight: CGFloat {
+        let itemCount = companionManager.agentDockItems.count
+        guard itemCount > 0 else { return 500 }
+        let lastRowTop = CGFloat(max(0, itemCount - 1)) * (dockItemSlotSize + dockItemSpacing)
+        return max(500, avatarTopOverdrawPadding + lastRowTop + max(dockItemSlotSize, hoverCardHeight) + 8)
+    }
+
+    private func rowOffset(for index: Int) -> CGFloat {
+        avatarTopOverdrawPadding + CGFloat(index) * (dockItemSlotSize + dockItemSpacing)
+    }
+
+    private func dockRow(for item: OdysseusAgentDockItem) -> some View {
+        let isExpanded = shouldShowExpandedCard(for: item)
+        return HStack(alignment: .top, spacing: 0) {
+            if layoutState.opensPanelsToRight {
+                dockButton(for: item)
+                hoverBridge(for: item, isExpanded: isExpanded)
+                expandedCard(for: item)
+            } else {
+                expandedCard(for: item)
+                hoverBridge(for: item, isExpanded: isExpanded)
+                dockButton(for: item)
+            }
+        }
+        // Keep the avatar position fixed with absolute row offsets, but let
+        // the active row's hover region grow to cover the full card. Without
+        // this, moving from the icon onto the visible card exits the 92pt row
+        // hit area and the card collapses under the cursor.
+        //
+        // The row itself must not advertise a full rectangular hit region:
+        // when expanded, that invisible rectangle covers the avatars below it
+        // and prevents hover from switching to a different parked task.
+        // Let the visible card and visible avatar button own hit-testing.
+        .frame(
+            width: 760,
+            height: isExpanded ? hoverCardHeight : dockItemSlotSize,
+            alignment: layoutState.opensPanelsToRight ? .topLeading : .topTrailing
+        )
+        .padding(.top, 0)
+        .padding(layoutState.opensPanelsToRight ? .leading : .trailing, 0)
+        .onHover { isHovering in
+            guard isExpanded || hoveredItemID == item.id else { return }
+            updateHoverState(for: item, isHovering: isHovering)
+        }
+    }
+
+
+    @ViewBuilder
+    private func expandedCard(for item: OdysseusAgentDockItem) -> some View {
+        // Collapsed by default — icon-only — until the user hovers. This
+        // removes both the always-on conversation preview AND the
+        // post-completion expanded summary card, matching the "just have the
+        // agent icon up there" UX.
+        if shouldShowExpandedCard(for: item) {
+            OdysseusAgentDockHoverCard(
+                item: item,
+                canOpenDashboard: companionManager.isAdvancedModeEnabled,
+                chat: { companionManager.openAgentDockItem(item.id) },
+                text: { companionManager.showTextFollowUpForAgentDockItem(item.id) },
+                voice: { companionManager.prepareVoiceFollowUpForAgentDockItem(item.id) },
+                close: {
+                    // Close should collapse this expanded hover panel
+                    // immediately, even while the cursor is still
+                    // over the dock icon. Keep the dock icon/task.
+                    manuallyClosedExpandedItemIDs.insert(item.id)
+                    hoveredItemID = nil
+                },
+                stop: { companionManager.stopAgentDockItem(item.id) },
+                dismiss: { companionManager.dismissAgentDockItem(item.id) },
+                runSuggestedAction: { actionTitle in
+                    companionManager.runSuggestedNextAction(actionTitle, forAgentDockItem: item.id)
+                }
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .onHover { isHovering in
+                updateHoverState(for: item, isHovering: isHovering)
+            }
+            .transition(.odysseusAgentDockCardSlide(opensToRight: layoutState.opensPanelsToRight))
+        }
+    }
+
+    @ViewBuilder
+    private func hoverBridge(for item: OdysseusAgentDockItem, isExpanded: Bool) -> some View {
+        if isExpanded {
+            Color.clear
+                .frame(width: 22, height: hoverCardHeight)
+                .contentShape(Rectangle())
+                .onHover { isHovering in
+                    updateHoverState(for: item, isHovering: isHovering)
+                }
+        }
+    }
+
+    private func dockButton(for item: OdysseusAgentDockItem) -> some View {
+        Button {
+            if didDragDock {
+                didDragDock = false
+                return
+            }
+            companionManager.openAgentDockItem(item.id)
+        } label: {
+            OdysseusAgentDockItemView(item: item)
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .pointerCursor()
+        .onHover { isHovering in
+            updateHoverState(for: item, isHovering: isHovering)
+        }
+        .onDrop(
+            of: [UTType.fileURL.identifier, UTType.image.identifier],
+            isTargeted: nil
+        ) { providers in
+            handleDroppedAgentAttachments(providers, for: item)
+        }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 2)
+                .onChanged { value in
+                    if !didDragDock {
+                        didDragDock = true
+                        companionManager.beginAgentDockDrag()
+                    }
+                    companionManager.dragAgentDock(by: value.translation)
+                }
+                .onEnded { _ in
+                    companionManager.endAgentDockDrag()
+                    DispatchQueue.main.async {
+                        didDragDock = false
+                    }
+                }
+        )
+    }
+
+    private func handleDroppedAgentAttachments(_ providers: [NSItemProvider], for item: OdysseusAgentDockItem) -> Bool {
+        var acceptedDrop = false
+
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                acceptedDrop = true
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { droppedItem, _ in
+                    guard let url = Self.fileURL(from: droppedItem) else { return }
+                    Task { @MainActor in
+                        companionManager.attachDroppedAgentFiles([url], toAgentDockItem: item.id, source: "agent_dock_avatar_drop")
+                    }
+                }
+                continue
+            }
+
+            if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                acceptedDrop = true
+                provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                    guard let data, let url = Self.persistDroppedImage(data) else { return }
+                    Task { @MainActor in
+                        companionManager.attachDroppedAgentFiles([url], toAgentDockItem: item.id, source: "agent_dock_avatar_drop")
+                    }
+                }
+            }
+        }
+
+        return acceptedDrop
+    }
+
+    private static func fileURL(from item: Any?) -> URL? {
+        if let url = item as? URL {
+            return url.isFileURL ? url.standardizedFileURL : nil
+        }
+        if let data = item as? Data {
+            return URL(dataRepresentation: data, relativeTo: nil)?.standardizedFileURL
+        }
+        if let data = item as? NSData {
+            return URL(dataRepresentation: data as Data, relativeTo: nil)?.standardizedFileURL
+        }
+        if let string = item as? String {
+            return URL(string: string)?.standardizedFileURL
+        }
+        return nil
+    }
+
+    private static func persistDroppedImage(_ data: Data) -> URL? {
+        let directory = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Odysseus/AgentMode/DroppedAttachments", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent("agent-dock-drop-\(UUID().uuidString).png")
+            try data.write(to: url, options: .atomic)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    private func shouldShowExpandedCard(for item: OdysseusAgentDockItem) -> Bool {
+        // Only expand on hover. Previously `.done` and `.failed` stayed
+        // expanded automatically so users could read the final summary,
+        // but per UX request 2026-04-28 the dock should be icon-only by
+        // default — hovering reveals the full card.
+        return hoveredItemID == item.id && !manuallyClosedExpandedItemIDs.contains(item.id)
+    }
+
+    private func updateHoverState(for item: OdysseusAgentDockItem, isHovering: Bool) {
+        let itemID = item.id
+        pendingHoverExit?.cancel()
+        pendingHoverExit = nil
+
+        if isHovering {
+            withAnimation(.easeOut(duration: 0.14)) {
+                hoveredItemID = itemID
+            }
+            return
+        }
+
+        let exitWorkItem = DispatchWorkItem {
+            guard hoveredItemID == itemID else { return }
+            withAnimation(.easeOut(duration: 0.14)) {
+                hoveredItemID = nil
+                // Re-enable expansion after the pointer leaves, so a later
+                // hover can open the panel again.
+                manuallyClosedExpandedItemIDs.remove(itemID)
+            }
+        }
+        pendingHoverExit = exitWorkItem
+        // AppKit can briefly report a leave from the parked icon before the
+        // newly revealed hover card/bridge receives its enter event. Keep a
+        // small grace window so the card stays open while the pointer travels
+        // into the actions, but still collapses naturally after a real exit.
+        //
+        // Finished/stopped agents need a longer hold because their visible
+        // card is primarily an action surface. SwiftUI/AppKit can emit a
+        // transient leave while the pointer crosses the glass buttons or
+        // while those buttons restyle on hover; do not collapse the parked
+        // agent before the user has a fair chance to click Text/Chat/Archive.
+        let graceDelay: TimeInterval
+        switch item.status {
+        case .done, .failed:
+            graceDelay = terminalHoverExitGraceDelay
+        case .starting, .running:
+            graceDelay = hoverExitGraceDelay
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + graceDelay, execute: exitWorkItem)
+    }
+}
+
+private struct OdysseusAgentDockCardRevealShape: Shape {
+    var progress: CGFloat
+    let revealsFromLeadingEdge: Bool
+
+    var animatableData: CGFloat {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let clampedProgress = min(max(progress, 0), 1)
+        let revealWidth = rect.width * clampedProgress
+        let revealX = revealsFromLeadingEdge ? rect.minX : rect.maxX - revealWidth
+        return Path(CGRect(x: revealX, y: rect.minY, width: revealWidth, height: rect.height))
+    }
+}
+
+private struct OdysseusAgentDockCardSlideModifier: ViewModifier {
+    let progress: CGFloat
+    let opensToRight: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .clipShape(
+                OdysseusAgentDockCardRevealShape(
+                    progress: progress,
+                    revealsFromLeadingEdge: opensToRight
+                )
+            )
+            // Nudge only toward the avatar while revealing. The old move
+            // transition offset the card by its full width, so right-parked
+            // avatars briefly drew the card from beyond the avatar before it
+            // settled. This keeps the avatar-side edge as the visual origin.
+            .offset(x: (opensToRight ? -14 : 14) * (1 - progress))
+            .opacity(Double(progress))
+    }
+}
+
+private extension AnyTransition {
+    static func odysseusAgentDockCardSlide(opensToRight: Bool) -> AnyTransition {
+        .modifier(
+            active: OdysseusAgentDockCardSlideModifier(progress: 0, opensToRight: opensToRight),
+            identity: OdysseusAgentDockCardSlideModifier(progress: 1, opensToRight: opensToRight)
+        )
+    }
+}
+
+private struct OdysseusAgentDockItemView: View {
+    let item: OdysseusAgentDockItem
+    @State private var isStatusAnimating = false
+    @State private var isAvatarGlowPulsing = false
+    @State private var isCompletionFlashVisible = false
+    @State private var lastObservedStatus: OdysseusAgentDockStatus?
+    @AppStorage(OdysseusCursorAvatarStyle.userDefaultsKey)
+    private var avatarStyleRawValue = OdysseusCursorAvatarStyle.default.storageValue
+
+    private var shouldShowAccentGlow: Bool {
+        switch OdysseusCursorAvatarStyle(storageValue: avatarStyleRawValue) {
+        case .triangleFilled, .triangleOutline:
+            return true
+        case .pet:
+            return false
+        }
+    }
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            completionFlashRing
+
+            Circle()
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color.black.opacity(0.82),
+                            Color(hex: "#101827").opacity(0.78)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                // Keep parked agents compact: the outer circle is 15%
+                // smaller than the previous 52pt treatment.
+                .frame(width: 44, height: 44)
+                .overlay(
+                    Circle()
+                        .stroke(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(0.26),
+                                    item.accentTheme.cursorColor.opacity(0.36),
+                                    Color.white.opacity(0.04)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1.1
+                        )
+                )
+                .shadow(
+                    color: shouldShowAccentGlow ? item.accentTheme.cursorColor.opacity(avatarOuterGlowOpacity) : .clear,
+                    radius: shouldShowAccentGlow ? avatarOuterGlowRadius : 0,
+                    x: 0,
+                    y: 11
+                )
+                .shadow(
+                    color: shouldShowAccentGlow ? item.accentTheme.cursorColor.opacity(avatarInnerGlowOpacity) : .clear,
+                    radius: shouldShowAccentGlow ? avatarInnerGlowRadius : 0,
+                    x: 0,
+                    y: 0
+                )
+                .shadow(color: Color.black.opacity(0.50), radius: 8, x: 0, y: 4)
+
+            OdysseusCursorAvatarView(accentColor: item.accentTheme.cursorColor)
+                .frame(width: 20, height: 26)
+                .rotationEffect(.degrees(2))
+                .shadow(
+                    color: shouldShowAccentGlow ? item.accentTheme.cursorColor.opacity(0.82) : .clear,
+                    radius: shouldShowAccentGlow ? 7 : 0,
+                    x: 0,
+                    y: 0
+                )
+                .frame(width: 44, height: 44)
+
+            statusIndicator
+                .offset(x: -2, y: 2)
+        }
+        .frame(width: 78, height: 78, alignment: .center)
+        .help(item.title)
+        .onAppear {
+            lastObservedStatus = item.status
+            isStatusAnimating = true
+            restartAvatarGlowPulse(for: item.status)
+        }
+        .onChange(of: item.status) {
+            let previousStatus = lastObservedStatus
+            lastObservedStatus = item.status
+
+            isStatusAnimating = false
+            DispatchQueue.main.async {
+                isStatusAnimating = true
+            }
+
+            restartAvatarGlowPulse(for: item.status)
+
+            if previousStatus != .done && item.status == .done {
+                triggerCompletionFlash()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var completionFlashRing: some View {
+        if shouldShowAccentGlow {
+            Circle()
+                .stroke(item.accentTheme.cursorColor.opacity(isCompletionFlashVisible ? 0.92 : 0), lineWidth: 2)
+                .frame(width: 53, height: 53)
+                .scaleEffect(isCompletionFlashVisible ? 1.18 : 0.88)
+                .opacity(isCompletionFlashVisible ? 0.95 : 0)
+                .shadow(
+                    color: item.accentTheme.cursorColor.opacity(isCompletionFlashVisible ? 0.86 : 0),
+                    radius: isCompletionFlashVisible ? 18 : 0,
+                    x: 0,
+                    y: 0
+                )
+                .animation(.easeOut(duration: 0.34), value: isCompletionFlashVisible)
+        }
+    }
+
+    private var statusIndicator: some View {
+        ZStack {
+            if shouldPulse {
+                Circle()
+                    .stroke(statusColor.opacity(statusPulseOpacity), lineWidth: 2)
+                    .frame(width: statusPulseSize, height: statusPulseSize)
+                    .scaleEffect(isStatusAnimating ? statusPulseScale : 0.72)
+                    .opacity(isStatusAnimating ? 0.08 : statusPulseOpacity)
+                    .animation(
+                        .easeInOut(duration: statusPulseDuration).repeatForever(autoreverses: false),
+                        value: isStatusAnimating
+                    )
+            }
+
+            Circle()
+                .fill(statusColor)
+                .frame(width: 9, height: 9)
+                .overlay(
+                    Circle()
+                        .stroke(Color.white.opacity(item.status == .done ? 0.42 : 0.28), lineWidth: 1)
+                )
+                .shadow(color: statusColor.opacity(statusGlowOpacity), radius: statusGlowRadius, x: 0, y: 0)
+                .scaleEffect(statusCoreScale)
+                .animation(
+                    shouldPulse
+                        ? .easeInOut(duration: statusPulseDuration * 0.5).repeatForever(autoreverses: true)
+                        : .easeOut(duration: DS.Animation.fast),
+                    value: isStatusAnimating
+                )
+        }
+        .frame(width: 22, height: 22)
+        .accessibilityLabel(statusAccessibilityLabel)
+    }
+
+
+    private var isWorkingStatus: Bool {
+        switch item.status {
+        case .starting, .running:
+            return true
+        case .done, .failed:
+            return false
+        }
+    }
+
+    private var avatarOuterGlowOpacity: Double {
+        if isCompletionFlashVisible { return 0.58 }
+        guard isWorkingStatus else { return 0.34 }
+        return isAvatarGlowPulsing ? 0.40 : 0.28
+    }
+
+    private var avatarOuterGlowRadius: CGFloat {
+        if isCompletionFlashVisible { return 30 }
+        guard isWorkingStatus else { return 24 }
+        return isAvatarGlowPulsing ? 28 : 22
+    }
+
+    private var avatarInnerGlowOpacity: Double {
+        if isCompletionFlashVisible { return 0.92 }
+        guard isWorkingStatus else { return 0.70 }
+        return isAvatarGlowPulsing ? 0.78 : 0.58
+    }
+
+    private var avatarInnerGlowRadius: CGFloat {
+        if isCompletionFlashVisible { return 20 }
+        guard isWorkingStatus else { return 16 }
+        return isAvatarGlowPulsing ? 18 : 14
+    }
+
+    private func restartAvatarGlowPulse(for status: OdysseusAgentDockStatus) {
+        guard shouldShowAccentGlow else {
+            isAvatarGlowPulsing = false
+            return
+        }
+
+        switch status {
+        case .starting, .running:
+            isAvatarGlowPulsing = false
+            DispatchQueue.main.async {
+                withAnimation(.easeInOut(duration: 2.8).repeatForever(autoreverses: true)) {
+                    isAvatarGlowPulsing = true
+                }
+            }
+        case .done, .failed:
+            withAnimation(.easeOut(duration: 0.24)) {
+                isAvatarGlowPulsing = false
+            }
+        }
+    }
+
+    private func triggerCompletionFlash() {
+        guard shouldShowAccentGlow else { return }
+
+        isCompletionFlashVisible = false
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.16)) {
+                isCompletionFlashVisible = true
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.36) {
+                withAnimation(.easeOut(duration: 0.42)) {
+                    isCompletionFlashVisible = false
+                }
+            }
+        }
+    }
+
+    private var statusColor: Color {
+        switch item.status {
+        case .starting:
+            return Color(hex: "#60A5FA")
+        case .running:
+            return Color(hex: "#3B82F6")
+        case .done:
+            return Color(hex: "#34D399")
+        case .failed:
+            return Color(hex: "#FF6369")
+        }
+    }
+
+    private var shouldPulse: Bool {
+        switch item.status {
+        case .starting, .running, .failed:
+            return true
+        case .done:
+            return false
+        }
+    }
+
+    private var statusPulseDuration: Double {
+        switch item.status {
+        case .starting:
+            return 1.1
+        case .running:
+            return 0.82
+        case .failed:
+            return 0.62
+        case .done:
+            return 1
+        }
+    }
+
+    private var statusPulseScale: CGFloat {
+        switch item.status {
+        case .failed:
+            return 1.35
+        default:
+            return 1.18
+        }
+    }
+
+    private var statusPulseSize: CGFloat {
+        switch item.status {
+        case .failed:
+            return 22
+        default:
+            return 20
+        }
+    }
+
+    private var statusPulseOpacity: Double {
+        switch item.status {
+        case .starting:
+            return 0.62
+        case .running:
+            return 0.76
+        case .failed:
+            return 0.88
+        case .done:
+            return 0
+        }
+    }
+
+    private var statusGlowOpacity: Double {
+        switch item.status {
+        case .done:
+            return 0.88
+        case .failed:
+            return 0.95
+        default:
+            return 0.72
+        }
+    }
+
+    private var statusGlowRadius: CGFloat {
+        switch item.status {
+        case .done:
+            return 5
+        case .failed:
+            return 7
+        default:
+            return 6
+        }
+    }
+
+    private var statusCoreScale: CGFloat {
+        guard shouldPulse else { return 1 }
+        return isStatusAnimating ? 1.08 : 0.88
+    }
+
+    private var statusAccessibilityLabel: String {
+        switch item.status {
+        case .starting:
+            return "Agent task is starting"
+        case .running:
+            return "Agent task is working"
+        case .done:
+            return "Agent task is done"
+        case .failed:
+            return "Agent task stopped"
+        }
+    }
+}
+
+private struct OdysseusAgentDockConversationPreview: View {
+    let item: OdysseusAgentDockItem
+    let canOpenDashboard: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            conversationBubble(
+                label: "YOU",
+                content: { userBubbleText },
+                labelColor: Color(hex: "#FF7A9A"),
+                backgroundColor: Color(hex: "#341214").opacity(0.96),
+                borderColor: Color(hex: "#7F1D3A").opacity(0.42)
+            )
+
+            conversationBubble(
+                label: "AGENT",
+                content: { agentBubbleContent },
+                labelColor: item.accentTheme.cursorColor.opacity(0.95),
+                backgroundColor: item.accentTheme.cursorColor.opacity(0.12),
+                borderColor: item.accentTheme.cursorColor.opacity(0.28)
+            )
+        }
+        .frame(width: 430, alignment: .leading)
+        .shadow(color: item.accentTheme.cursorColor.opacity(0.18), radius: 18, x: 0, y: 8)
+        .shadow(color: Color.black.opacity(0.30), radius: 10, x: 0, y: 6)
+    }
+
+    private func conversationBubble<Content: View>(
+        label: String,
+        @ViewBuilder content: () -> Content,
+        labelColor: Color,
+        backgroundColor: Color,
+        borderColor: Color
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label)
+                .font(.system(size: 10, weight: .heavy, design: .rounded))
+                .foregroundColor(labelColor)
+                .kerning(0.4)
+
+            content()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(backgroundColor)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(borderColor, lineWidth: 1)
+        )
+    }
+
+    /// The full user instruction — no clipping. The dock card width and
+    /// `lineLimit(nil)` let it wrap so the user sees exactly what was sent.
+    private var userBubbleText: some View {
+        Text(fullUserInstruction)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundColor(DS.Colors.textPrimary)
+            .lineLimit(nil)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// Either the latest streamed assistant text, or a live "thinking"
+    /// indicator while we wait for the first token. Never the canned
+    /// "An agent is working on this." string.
+    @ViewBuilder
+    private var agentBubbleContent: some View {
+        let trimmedCaption = item.caption?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if trimmedCaption.isEmpty {
+            switch item.status {
+            case .starting, .running:
+                OdysseusThinkingDots(tint: item.accentTheme.cursorColor)
+            case .done:
+                Text("Done.")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(item.accentTheme.cursorColor)
+            case .failed:
+                Text("Stopped.")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textPrimary)
+            }
+        } else {
+            Text(trimmedCaption)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textPrimary)
+                .lineLimit(nil)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var fullUserInstruction: String {
+        let fullInstruction = item.userInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !fullInstruction.isEmpty { return fullInstruction }
+        let trimmedTitle = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedTitle.isEmpty ? "hey there" : trimmedTitle
+    }
+}
+
+private final class OdysseusAgentDockPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+@MainActor
+final class OdysseusAgentDockWindowManager {
+    private var panel: NSPanel?
+    private var dragStartFrame: NSRect?
+    private var dragStartMouseLocation: CGPoint?
+    private var customFrame: NSRect?
+    private let layoutState = OdysseusAgentDockLayoutState()
+    private let dockWidth: CGFloat = 800
+    private let minimumDockHeight: CGFloat = 540
+    // The parked dock window is intentionally a transparent full-height strip
+    // on the active screen. Keeping the window taller than the avatar stack
+    // gives glows, status rings, and top-parked icons room to overdraw instead
+    // of being clipped by the NSPanel/content-view bounds.
+    private let dockVerticalScreenInset: CGFloat = 16
+    private let dockAvatarTopOverdrawPadding: CGFloat = 54
+    private let dockAvatarBottomOverdrawPadding: CGFloat = 8
+    private var dockVerticalPadding: CGFloat {
+        dockAvatarTopOverdrawPadding + dockAvatarBottomOverdrawPadding
+    }
+    private let hoverCardHeight: CGFloat = 236
+    private let hoverCardWidth: CGFloat = 560
+    // Track the icon container size used by `OdysseusAgentDockItemView`. Used
+    // by `textFollowUpOrigin()` to position follow-up popovers relative to
+    // the icon's actual width.
+    private let dockIconWidth: CGFloat = 78
+    // Trailing inset between the dock icon and the panel's right edge.
+    // Reduced together with the SwiftUI inner paddings so the icon sits
+    // closer to the screen corner.
+    private let dockTrailingInset: CGFloat = 0
+    private let dockItemSpacing: CGFloat = 22
+    private let dockRowSpacing: CGFloat = 12
+
+    func show(
+        companionManager: CompanionManager,
+        onScreen screen: NSScreen,
+        position: AgentParkingPosition
+    ) {
+        let targetSize = preferredDockSize(itemCount: companionManager.agentDockItems.count, on: screen)
+        layoutState.dockHeight = targetSize.height
+
+        if panel == nil {
+            createPanel(companionManager: companionManager, initialSize: targetSize)
+        }
+
+        if let customFrame {
+            let resizedFrame = resizedCustomFrame(customFrame, to: targetSize, on: screen)
+            self.customFrame = resizedFrame
+            panel?.setFrame(resizedFrame, display: true)
+            updatePanelExpansionDirection(for: resizedFrame, fallbackScreen: screen, fallbackPosition: position)
+        } else {
+            layoutState.opensPanelsToRight = position.opensAgentPanelsToRight
+            positionPanel(onScreen: screen, position: position, size: targetSize)
+        }
+        panel?.orderFrontRegardless()
+    }
+
+    func hide() {
+        panel?.orderOut(nil)
+    }
+
+    func beginDrag() {
+        dragStartFrame = panel?.frame
+        dragStartMouseLocation = NSEvent.mouseLocation
+    }
+
+    func drag(by translation: CGSize) {
+        guard let panel, let dragStartFrame else { return }
+        let frame: NSRect
+        if let dragStartMouseLocation {
+            // Keep the dock visually locked to the cursor by computing deltas
+            // from global mouse positions. This avoids SwiftUI gesture
+            // translation lag when the panel itself is moving during drag.
+            let currentMouseLocation = NSEvent.mouseLocation
+            let dx = currentMouseLocation.x - dragStartMouseLocation.x
+            let dy = currentMouseLocation.y - dragStartMouseLocation.y
+            frame = NSRect(
+                x: dragStartFrame.origin.x + dx,
+                y: dragStartFrame.origin.y + dy,
+                width: dragStartFrame.width,
+                height: dragStartFrame.height
+            )
+        } else {
+            frame = NSRect(
+                x: dragStartFrame.origin.x + translation.width,
+                y: dragStartFrame.origin.y - translation.height,
+                width: dragStartFrame.width,
+                height: dragStartFrame.height
+            )
+        }
+        // Keep updates lightweight while dragging; AppKit redraws naturally
+        // on the next pass and this reduces perceived "left behind" lag.
+        panel.setFrame(frame, display: false)
+        customFrame = frame
+        updatePanelExpansionDirection(for: frame)
+    }
+
+    func endDrag() {
+        customFrame = panel?.frame ?? customFrame
+        dragStartFrame = nil
+        dragStartMouseLocation = nil
+    }
+
+    /// When true, the dock was manually moved and should not auto-follow
+    /// cursor screen changes until explicitly reset.
+    var hasUserPinnedFrame: Bool {
+        customFrame != nil
+    }
+
+    func textFollowUpOrigin() -> CGPoint? {
+        guard let panel else { return nil }
+        let frame = panel.frame
+        let hoverCardX = layoutState.opensPanelsToRight
+            ? frame.minX + dockTrailingInset + dockIconWidth + dockItemSpacing
+            : frame.maxX - dockTrailingInset - dockIconWidth - dockItemSpacing - hoverCardWidth
+        return CGPoint(
+            x: hoverCardX,
+            y: frame.minY - 62
+        )
+    }
+
+    func dockIconCenter(for itemID: UUID, in items: [OdysseusAgentDockItem]) -> CGPoint? {
+        guard let panel,
+              let itemIndex = items.firstIndex(where: { $0.id == itemID }) else {
+            return nil
+        }
+
+        // Mirror `OdysseusAgentDockStackView`'s row placement so cursor handoff
+        // flights land on the real parked avatar instead of an approximate
+        // parking edge. AppKit frames are bottom-left based; SwiftUI rows are
+        // measured down from the panel's top edge.
+        let rowSpacing: CGFloat = dockIconWidth + dockRowSpacing
+        let iconCenterX = layoutState.opensPanelsToRight
+            ? panel.frame.minX + dockTrailingInset + dockIconWidth / 2
+            : panel.frame.maxX - dockTrailingInset - dockIconWidth / 2
+        let iconCenterY = panel.frame.maxY
+            - dockAvatarTopOverdrawPadding
+            - CGFloat(itemIndex) * rowSpacing
+            - dockIconWidth / 2
+
+        return CGPoint(x: iconCenterX, y: iconCenterY)
+    }
+
+    private func createPanel(companionManager: CompanionManager, initialSize: NSSize) {
+        let dockPanel = OdysseusAgentDockPanel(
+            contentRect: NSRect(origin: .zero, size: initialSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        dockPanel.isOpaque = false
+        dockPanel.backgroundColor = .clear
+        OdysseusWindowLevels.applyCursorOverlayLevel(to: dockPanel)
+        dockPanel.hasShadow = false
+        dockPanel.hidesOnDeactivate = false
+        dockPanel.isReleasedWhenClosed = false
+        dockPanel.isMovable = false
+        dockPanel.isMovableByWindowBackground = false
+        dockPanel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+
+        let rootView = OdysseusAgentDockStackView(companionManager: companionManager, layoutState: layoutState)
+            .frame(width: dockWidth, height: layoutState.dockHeight, alignment: .topTrailing)
+        let hostingView = NSHostingView(rootView: rootView)
+        if #available(macOS 13.0, *) {
+            // Critical: keep SwiftUI from driving the NSPanel's size from
+            // its ideal content size. Hover cards/caption changes animate
+            // the SwiftUI tree frequently; when the hosting view is the
+            // window contentView, AppKit can enter a recursive constraints
+            // pass and throw NSGenericException. A fixed AppKit container
+            // owns the panel size; SwiftUI only draws inside it.
+            hostingView.sizingOptions = []
+        }
+        let containerView = NSView(frame: NSRect(origin: .zero, size: initialSize))
+        containerView.wantsLayer = true
+        containerView.layer?.backgroundColor = NSColor.clear.cgColor
+        hostingView.frame = containerView.bounds
+        hostingView.autoresizingMask = [.width, .height]
+        containerView.addSubview(hostingView)
+        dockPanel.contentView = containerView
+        panel = dockPanel
+    }
+
+    private func positionPanel(onScreen screen: NSScreen, position: AgentParkingPosition, size: NSSize) {
+        guard let panel else { return }
+        // Keep the previous extra top padding for top-anchored positions
+        // (notification banners + menu bar leave less usable area at the
+        // top), and use a smaller default elsewhere.
+        let edgeInset: CGFloat
+        switch position {
+        case .topLeft, .topCenter, .topRight:
+            edgeInset = max(56, screen.frame.maxY - screen.visibleFrame.maxY + 56)
+        default:
+            edgeInset = 16
+        }
+        var origin = position.originForWindow(size: size, on: screen, edgeInset: edgeInset)
+        // UX tweak (2026-05-01): move the default top-right parked dock
+        // closer into the corner by nudging it up/right.
+        if position == .topRight {
+            origin.x += 82
+            origin.y += 82
+        }
+        origin = clampedDockOrigin(origin, size: size, on: screen)
+        let targetFrame = NSRect(origin: origin, size: size)
+        guard panel.frame.integral != targetFrame.integral else { return }
+        panel.setFrame(targetFrame, display: true)
+    }
+
+    private func preferredDockSize(itemCount: Int, on screen: NSScreen) -> NSSize {
+        let lastRowTop = CGFloat(max(0, itemCount - 1)) * (dockIconWidth + dockRowSpacing)
+        let unclampedHeight = max(
+            minimumDockHeight,
+            lastRowTop + max(dockIconWidth, hoverCardHeight) + dockVerticalPadding
+        )
+        let fullHeightStrip = max(minimumDockHeight, screen.visibleFrame.height - dockVerticalScreenInset)
+        return NSSize(
+            width: dockWidth,
+            height: max(unclampedHeight, fullHeightStrip)
+        )
+    }
+
+    private func resizedCustomFrame(_ frame: NSRect, to targetSize: NSSize, on screen: NSScreen) -> NSRect {
+        var origin = frame.origin
+
+        // If a dragged dock is visually parked near the top half, keep its
+        // top edge stable as the panel grows for more avatars. Otherwise it
+        // would expand upward and clip against the menu bar/visible screen.
+        if frame.midY >= screen.visibleFrame.midY {
+            origin.y = frame.maxY - targetSize.height
+        }
+
+        origin = clampedDockOrigin(origin, size: targetSize, on: screen)
+
+        return NSRect(origin: origin, size: targetSize)
+    }
+
+    private func clampedDockOrigin(_ origin: CGPoint, size: NSSize, on screen: NSScreen) -> CGPoint {
+        CGPoint(
+            x: min(max(origin.x, screen.visibleFrame.minX - hoverCardWidth), screen.visibleFrame.maxX - dockIconWidth + 8),
+            y: min(max(origin.y, screen.visibleFrame.minY + 8), screen.visibleFrame.maxY - size.height - 8)
+        )
+    }
+
+    private func updatePanelExpansionDirection(
+        for frame: NSRect,
+        fallbackScreen: NSScreen? = nil,
+        fallbackPosition: AgentParkingPosition? = nil
+    ) {
+        let screen = NSScreen.screens.first(where: { $0.visibleFrame.intersects(frame) }) ?? fallbackScreen
+        guard let screen else {
+            if let fallbackPosition {
+                layoutState.opensPanelsToRight = fallbackPosition.opensAgentPanelsToRight
+            }
+            return
+        }
+
+        let iconCenterX = layoutState.opensPanelsToRight
+            ? frame.minX + dockTrailingInset + dockIconWidth / 2
+            : frame.maxX - dockTrailingInset - dockIconWidth / 2
+        layoutState.opensPanelsToRight = iconCenterX < screen.visibleFrame.midX
+    }
+}
+
+// Manager for overlay windows — creates one per screen so the cursor
+// buddy seamlessly follows the cursor across multiple monitors.
+@MainActor
+class OverlayWindowManager {
+    private var overlayWindows: [OverlayWindow] = []
+    private weak var companionManager: CompanionManager?
+    private var displayConfigurationObserver: NSObjectProtocol?
+    private var interactivityTimer: Timer?
+    var hasShownOverlayBefore = false
+
+    init() {
+        displayConfigurationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshOverlayWindowsForCurrentScreens()
+            }
+        }
+    }
+
+    deinit {
+        // The calibration event tap / key monitors are @MainActor resources and
+        // cannot be touched from this nonisolated deinit. They are torn down in
+        // stopCalibrationKeyboardTracking() via every hideOverlay/fadeOut path.
+        if let displayConfigurationObserver {
+            NotificationCenter.default.removeObserver(displayConfigurationObserver)
+        }
+    }
+
+    func showOverlay(onScreens screens: [NSScreen], companionManager: CompanionManager) {
+        // Hide any existing overlays
+        hideOverlay(clearCompanionManager: false)
+        self.companionManager = companionManager
+
+        // Track if this is the first time showing overlay (welcome message)
+        let isFirstAppearance = !hasShownOverlayBefore
+        hasShownOverlayBefore = true
+
+        // Create one overlay window per screen
+        for screen in screens {
+            let window = OverlayWindow(screen: screen)
+
+            let contentView = BlueCursorView(
+                screenFrame: screen.frame,
+                isFirstAppearance: isFirstAppearance,
+                companionManager: companionManager
+            )
+
+            let hostingView = NSHostingView(rootView: contentView)
+            hostingView.frame = NSRect(origin: .zero, size: screen.frame.size)
+            hostingView.autoresizingMask = [.width, .height]
+            window.contentView = hostingView
+
+            overlayWindows.append(window)
+            window.orderFrontRegardless()
+        }
+
+        startInteractivityTracking()
+    }
+
+    func hideOverlay() {
+        hideOverlay(clearCompanionManager: true)
+    }
+
+    private func hideOverlay(clearCompanionManager: Bool) {
+        stopInteractivityTracking()
+        for window in overlayWindows {
+            window.orderOut(nil)
+            window.contentView = nil
+        }
+        overlayWindows.removeAll()
+        if clearCompanionManager {
+            companionManager = nil
+        }
+    }
+
+    // MARK: - Click-through overlay interactivity
+    //
+    // The overlay windows are full-screen and sit above Odysseus's main
+    // dialog in the shared window-level stack. Keep them click-through
+    // (`ignoresMouseEvents = true`) so temporary visual guidance never
+    // swallows clicks in the app behind it.
+    private func startInteractivityTracking() {
+        stopInteractivityTracking()
+        updateOverlayInteractivity()
+    }
+
+    private func stopInteractivityTracking() {
+        interactivityTimer?.invalidate()
+        interactivityTimer = nil
+    }
+
+    private func updateOverlayInteractivity() {
+        for window in overlayWindows {
+            window.ignoresMouseEvents = true
+        }
+    }
+
+    /// Fades out overlay windows over `duration` seconds, then removes them.
+    func fadeOutAndHideOverlay(duration: TimeInterval = 0.4) {
+        stopInteractivityTracking()
+        let windowsToFade = overlayWindows
+        overlayWindows.removeAll()
+
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = duration
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            for window in windowsToFade {
+                window.animator().alphaValue = 0
+            }
+        }, completionHandler: {
+            for window in windowsToFade {
+                window.orderOut(nil)
+                window.contentView = nil
+            }
+        })
+    }
+
+    func isShowingOverlay() -> Bool {
+        return !overlayWindows.isEmpty
+    }
+
+    private func refreshOverlayWindowsForCurrentScreens() {
+        guard !overlayWindows.isEmpty, let companionManager else { return }
+        showOverlay(onScreens: NSScreen.screens, companionManager: companionManager)
+    }
+}

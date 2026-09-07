@@ -1,0 +1,288 @@
+import Foundation
+
+struct OdysseusCodexConfigTemplate: Equatable {
+    static let defaultModelProviderID = "openai"
+    static let customModelProviderID = "odysseus"
+
+    var model: String
+    var reasoningEffort: String
+    var workerBaseURL: URL
+    var modelInstructionsFileName: String
+    var bundledSkillsDirectoryName: String
+    var learnedSkillsDirectoryName: String
+    var includeOpenAIDeveloperDocsMCP: Bool
+    var includeComposioConnectMCP: Bool
+    var includeOdysseusControlMCP: Bool
+    var cuaDriverMCPCommand: String?
+    var preferAPIKeyAuthForDefaultOpenAI: Bool
+
+    init(
+        model: String = OdysseusModelCatalog.defaultCodexActionsModelID,
+        reasoningEffort: String = "medium",
+        workerBaseURL: URL = OdysseusCodexBackend.configuredWorkerBaseURL(),
+        modelInstructionsFileName: String = "OdysseusModelInstructions.md",
+        bundledSkillsDirectoryName: String = "OdysseusBundledSkills",
+        learnedSkillsDirectoryName: String = "OdysseusLearnedSkills",
+        includeOpenAIDeveloperDocsMCP: Bool = false,
+        includeComposioConnectMCP: Bool = false,
+        includeOdysseusControlMCP: Bool = false,
+        cuaDriverMCPCommand: String? = nil,
+        preferAPIKeyAuthForDefaultOpenAI: Bool = false
+    ) {
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.workerBaseURL = workerBaseURL
+        self.modelInstructionsFileName = modelInstructionsFileName
+        self.bundledSkillsDirectoryName = bundledSkillsDirectoryName
+        self.learnedSkillsDirectoryName = learnedSkillsDirectoryName
+        self.includeOpenAIDeveloperDocsMCP = includeOpenAIDeveloperDocsMCP
+        self.includeComposioConnectMCP = includeComposioConnectMCP
+        self.includeOdysseusControlMCP = includeOdysseusControlMCP
+        self.cuaDriverMCPCommand = cuaDriverMCPCommand
+        self.preferAPIKeyAuthForDefaultOpenAI = preferAPIKeyAuthForDefaultOpenAI
+    }
+
+    var openAICompatibleEndpoint: URL {
+        if workerBaseURL.lastPathComponent == "v1" {
+            return workerBaseURL
+        }
+        return workerBaseURL.appendingPathComponent("v1", isDirectory: false)
+    }
+
+    var modelProviderID: String {
+        OdysseusCodexBackend.isDefaultOpenAIBaseURL(workerBaseURL) ? Self.defaultModelProviderID : Self.customModelProviderID
+    }
+
+    func render() -> String {
+        var lines: [String] = [
+            "model = \"\(escape(model))\"",
+            "model_reasoning_effort = \"\(escape(reasoningEffort))\"",
+            "model_provider = \"\(modelProviderID)\"",
+            "preferred_auth_method = \"\(preferredAuthMethod)\"",
+            "approval_policy = \"never\"",
+            "sandbox_mode = \"danger-full-access\"",
+            "personality = \"friendly\"",
+            "cli_auth_credentials_store = \"file\"",
+            "history.persistence = \"save-all\"",
+            "",
+            "[analytics]",
+            "enabled = false"
+        ]
+
+        if !OdysseusCodexBackend.isDefaultOpenAIBaseURL(workerBaseURL) {
+            lines.append(contentsOf: [
+                "",
+                "[model_providers.\(Self.customModelProviderID)]",
+                "name = \"Odysseus\"",
+                "env_key = \"OPENAI_API_KEY\"",
+                "base_url = \"\(escape(openAICompatibleEndpoint.absoluteString))\"",
+                "wire_api = \"responses\"",
+                "trust_level = \"trusted\"",
+                "hide_full_access_warning = true",
+                "fast_mode = true",
+                "multi_agent = true"
+            ])
+        }
+
+        if includeOpenAIDeveloperDocsMCP {
+            lines.append(contentsOf: [
+                "",
+                "[mcp_servers.openaiDeveloperDocs]",
+                "url = \"https://developers.openai.com/mcp\""
+            ])
+        }
+
+        if includeComposioConnectMCP {
+            lines.append(contentsOf: [
+                "",
+                "[mcp_servers.composio]",
+                "url = \"https://connect.composio.dev/mcp\""
+            ])
+        }
+
+        if let cuaDriverMCPCommand = normalizedOptionalString(cuaDriverMCPCommand) {
+            lines.append(contentsOf: [
+                "",
+                "[mcp_servers.cuaDriver]",
+                "command = \"\(escape(cuaDriverMCPCommand))\"",
+                // Keep the driver inside Odysseus's macOS permission
+                // identity. Current Cua Driver releases otherwise proxy to a
+                // separately installed CuaDriver.app, which splits TCC grants
+                // and makes the bundled runtime unusable on a clean install.
+                "args = [\"mcp\", \"--direct\", \"--embedded\", \"--no-overlay\"]",
+                "",
+                "[mcp_servers.cuaDriver.env]",
+                "CUA_DRIVER_EMBEDDED = \"1\"",
+                "CUA_DRIVER_TELEMETRY_ENABLED = \"false\"",
+                "CUA_TELEMETRY_ENABLED = \"false\""
+            ])
+        }
+
+        if includeOdysseusControlMCP {
+            lines.append(contentsOf: [
+                "",
+                "[mcp_servers.odysseusControl]",
+                "url = \"http://127.0.0.1:32123/mcp\""
+            ])
+        }
+
+        lines.append(contentsOf: [
+            "",
+            "[[skills.config]]",
+            "model_instructions_file = \"\(escape(modelInstructionsFileName))\"",
+            "bundled_skills_dir = \"\(escape(bundledSkillsDirectoryName))\"",
+            "enabled = true",
+            "",
+            "[[skills.config]]",
+            "model_instructions_file = \"\(escape(modelInstructionsFileName))\"",
+            "bundled_skills_dir = \"\(escape(learnedSkillsDirectoryName))\"",
+            "enabled = true"
+        ])
+
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    private var preferredAuthMethod: String {
+        guard OdysseusCodexBackend.isDefaultOpenAIBaseURL(workerBaseURL) else { return "apikey" }
+        return preferAPIKeyAuthForDefaultOpenAI ? "apikey" : "chatgpt"
+    }
+
+    private func normalizedOptionalString(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func escape(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            // M19: TOML basic strings cannot contain raw newlines or control
+            // chars (U+0000–U+001F); leaving them in made the generated
+            // config.toml unparseable on bad input. Replace newlines with a
+            // space and strip all other control characters.
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .filter { (" \t".contains($0)) || ($0.unicodeScalars.allSatisfy { $0.value >= 0x20 }) }
+    }
+}
+
+nonisolated enum CuaDriverMCPConfiguration {
+    static let environmentOverrideKey = "ODYSSEUS_CUA_DRIVER_MCP_COMMAND"
+    static let knownCommandPaths = [
+        "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
+        "/usr/local/bin/cua-driver",
+        "/opt/homebrew/bin/cua-driver"
+    ]
+
+    static func resolvedCommandPath(
+        fileManager: FileManager = .default,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        if let override = normalized(environment[environmentOverrideKey]) {
+            return override
+        }
+
+        if let bundled = bundledRuntimeExecutableURL(fileManager: fileManager) {
+            return bundled.path
+        }
+
+        return knownCommandPaths.first { fileManager.isExecutableFile(atPath: $0) || fileManager.fileExists(atPath: $0) }
+    }
+
+    static func bundledRuntimeExecutableURL(
+        bundle: Bundle = .main,
+        fileManager: FileManager = .default
+    ) -> URL? {
+        // Release builds copy CuaDriverRuntime directly into the app's
+        // Resources directory. Resolve that bundle location first; the source
+        // checkout fallback is only for development/test execution.
+        var runtimeDirectories: [URL] = []
+        if let bundledRuntime = bundle.url(forResource: "CuaDriverRuntime", withExtension: nil) {
+            runtimeDirectories.append(bundledRuntime)
+        }
+        if let resourceURL = bundle.resourceURL {
+            runtimeDirectories.append(resourceURL.appendingPathComponent("CuaDriverRuntime", isDirectory: true))
+        }
+        if let sourceResources = CodexRuntimeLocator.sourceAppResourcesDirectory(fileManager: fileManager) {
+            runtimeDirectories.append(sourceResources.appendingPathComponent("CuaDriverRuntime", isDirectory: true))
+        }
+
+        for runtimeDirectory in runtimeDirectories {
+            let executable = runtimeDirectory.appendingPathComponent("cua-driver", isDirectory: false)
+            if fileManager.isExecutableFile(atPath: executable.path) {
+                return executable
+            }
+        }
+        return nil
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+enum OdysseusCodexBackend {
+    static let defaultOpenAIBaseURL = URL(string: "https://api.openai.com/v1")!
+    static let odysseusLocalModelBaseURL = URL(string: "http://127.0.0.1:32124")!
+
+    static func configuredWorkerBaseURL() -> URL {
+        // Never route Codex agents at the local MLX endpoint: mlx_lm only serves
+        // /v1/chat/completions, while Codex requires the Responses API, so that
+        // endpoint 404s on /v1/responses. Ignore it wherever it is configured.
+        if let raw = ProcessInfo.processInfo.environment["CLICKY_AGENT_BASE_URL"],
+           let url = validatedWorkerBaseURL(raw),
+           !isOdysseusLocalModelBaseURL(url) {
+            return url
+        }
+
+        if let raw = UserDefaults.standard.string(forKey: "odysseusAgentBaseURL"),
+           let url = validatedWorkerBaseURL(raw),
+           !isOdysseusLocalModelBaseURL(url) {
+            return url
+        }
+
+        return defaultOpenAIBaseURL
+    }
+
+    static func validatedWorkerBaseURL(_ rawValue: String) -> URL? {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = components.host,
+              !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let url = components.url
+        else {
+            return nil
+        }
+        // M15: reject http:// for non-loopback hosts in code (don't lean on ATS).
+        // A remote http endpoint would send the OpenAI key over plaintext.
+        if scheme == "http", host != "127.0.0.1", host != "localhost" {
+            return nil
+        }
+        return url
+    }
+
+    static func isDefaultOpenAIBaseURL(_ url: URL) -> Bool {
+        normalizedBaseURL(url) == normalizedBaseURL(defaultOpenAIBaseURL)
+    }
+
+    static func isOdysseusLocalModelBaseURL(_ url: URL) -> Bool {
+        normalizedBaseURL(url) == normalizedBaseURL(odysseusLocalModelBaseURL)
+    }
+
+    private static func normalizedBaseURL(_ url: URL) -> String {
+        var normalized = url.absoluteString
+        while normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
+        if !normalized.hasSuffix("/v1") {
+            normalized += "/v1"
+        }
+        return normalized.lowercased()
+    }
+}

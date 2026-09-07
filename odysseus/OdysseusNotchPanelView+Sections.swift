@@ -1,0 +1,2714 @@
+import AppKit
+import OCAutomation
+import SwiftUI
+import UniformTypeIdentifiers
+
+extension OdysseusNotchPanelView {
+
+    var panelRoot: some View {
+        VStack(spacing: 0) {
+            mainSurface
+        }
+        .frame(minWidth: 390, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.clear)
+    }
+
+    private var stopTaskDialogBinding: Binding<Bool> {
+        Binding(
+            get: { pendingStopAgentSessionID != nil },
+            set: { isPresented in
+                if !isPresented {
+                    pendingStopAgentSessionID = nil
+                }
+            }
+        )
+    }
+
+    private var archiveTaskDialogBinding: Binding<Bool> {
+        Binding(
+            get: { pendingArchiveAgentSessionID != nil },
+            set: { isPresented in
+                if !isPresented {
+                    pendingArchiveAgentSessionID = nil
+                }
+            }
+        )
+    }
+
+    func panelDialogs<Content: View>(_ content: Content) -> some View {
+        content
+        .sheet(isPresented: $isShowingHatchSheet) {
+            hatchPetSheet
+        }
+        .confirmationDialog(
+            "Stop this running Odysseus task?",
+            isPresented: stopTaskDialogBinding,
+            titleVisibility: .visible
+        ) {
+            Button("Stop task", role: .destructive) {
+                confirmStopPendingAgentSession()
+            }
+            Button("Keep running", role: .cancel) {
+                pendingStopAgentSessionID = nil
+            }
+        } message: {
+            Text("Running tasks cannot be archived. Stop it first if you want to move it out of the active list.")
+        }
+        .confirmationDialog(
+            "Archive this incomplete Odysseus task?",
+            isPresented: archiveTaskDialogBinding,
+            titleVisibility: .visible
+        ) {
+            Button("Archive incomplete task", role: .destructive) {
+                confirmArchivePendingAgentSession()
+            }
+            Button("Keep active", role: .cancel) {
+                pendingArchiveAgentSessionID = nil
+            }
+        } message: {
+            Text("This task is paused, stopped, or has not finished cleanly. Completed tasks archive immediately; incomplete tasks need confirmation so active work is not hidden by mistake.")
+        }
+    }
+
+    func panelLifecycle<Content: View>(_ content: Content) -> some View {
+        content
+        .onAppear {
+            syncHomeChatMode(source: "panel_appear")
+            syncCompactChatVisibility()
+            focusQuickPromptIfHome()
+            focusExpandedAgentPromptIfNeeded()
+            notifyPanelSizeChanged()
+        }
+        .task {
+            await refreshGogStatus()
+            focusQuickPromptIfHome()
+            focusExpandedAgentPromptIfNeeded()
+        }
+        .onChange(of: selectedTab) {
+            syncHomeChatMode(source: "panel_tab_changed")
+            syncCompactChatVisibility()
+            focusQuickPromptIfHome()
+            focusExpandedAgentPromptIfNeeded()
+            notifyPanelSizeChanged()
+        }
+        .onChange(of: quickPromptMode) {
+            syncHomeChatMode(source: "panel_mode_changed")
+            syncCompactChatVisibility()
+            if suppressNextHomeSuggestionResize && selectedTab == .home {
+                suppressNextHomeSuggestionResize = false
+                return
+            }
+            notifyPanelSizeChanged()
+        }
+        .onChange(of: quickPromptAttachments.count) {
+            notifyPanelSizeChanged()
+        }
+        .onChange(of: expandedAgentAttachments.count) {
+            notifyPanelSizeChanged()
+        }
+        .onChange(of: companionManager.codexAgentSession.entries.count) {
+            guard quickPromptMode == .chat else { return }
+            syncCompactChatVisibility()
+            notifyPanelSizeChanged()
+        }
+        .onChange(of: companionManager.codexAgentSession.isTurnActiveForChatQueue) {
+            guard quickPromptMode == .chat else { return }
+            syncCompactChatVisibility()
+            notifyPanelSizeChanged()
+        }
+        .onChange(of: expandedAgentSessionID) {
+            focusExpandedAgentPromptIfNeeded()
+            notifyPanelSizeChanged()
+        }
+        .onChange(of: agentSessionFilter) {
+            expandedAgentSessionID = nil
+            notifyPanelSizeChanged()
+        }
+        .onChange(of: gogStatus) {
+            notifyPanelSizeChanged()
+        }
+    }
+
+    func resizeAwarePanel<Content: View>(_ content: Content) -> some View {
+        content
+        .onReceive(NotificationCenter.default.publisher(for: .odysseusMainPanelResizeStateDidChange)) { notification in
+            isPanelUserResizing = (notification.userInfo?["isResizing"] as? Bool) ?? false
+        }
+        .transaction { transaction in
+            if isPanelUserResizing {
+                transaction.animation = nil
+                transaction.disablesAnimations = true
+            }
+        }
+    }
+
+    private var mainSurface: some View {
+        VStack(spacing: 12) {
+            tabStrip
+
+            tabContentLayer
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(
+                    OdysseusLiquidGlassBackdropView.isLiquidGlassAvailable ?
+                        // Keep a real SwiftUI surface under the native glass.
+                        // NSGlassEffectView can momentarily flatten when the
+                        // panel loses key focus; a transparent host makes that
+                        // look like the panel sides are being clipped away.
+                        AnyShapeStyle(DS.Colors.surface1.opacity(0.22)) :
+                        AnyShapeStyle(LinearGradient(
+                            colors: [DS.Colors.surface1.opacity(0.98), (DS.Colors.isDarkMode ? Color.black : Color.white).opacity(0.96)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ))
+                )
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .stroke(DS.Colors.borderSubtle.opacity(0.55), lineWidth: 0.8)
+                .allowsHitTesting(false)
+        )
+        .overlay {
+            if isPanelDropTargeted && !isQuickPromptDropTargeted && !isExpandedAgentDropTargeted {
+                dropTargetOverlay
+                    .padding(14)
+                    .allowsHitTesting(false)
+            }
+        }
+        .onDrop(
+            of: Self.supportedAttachmentDropTypes,
+            isTargeted: $isPanelDropTargeted,
+            perform: handlePanelAttachmentDrop
+        )
+        .animation(.easeOut(duration: 0.16), value: isPanelDropTargeted)
+        .animation(isPanelUserResizing ? nil : .spring(response: 0.24, dampingFraction: 0.88), value: quickPromptMode)
+        .animation(isPanelUserResizing ? nil : .spring(response: 0.24, dampingFraction: 0.88), value: isCompactChatExpanded)
+    }
+
+    private var tabContentLayer: some View {
+        ZStack(alignment: .topLeading) {
+            tabContent
+                .id(selectedTab.rawValue)
+                .transition(tabSwitchTransition)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .clipped()
+        .animation(isPanelUserResizing ? nil : .spring(response: 0.24, dampingFraction: 0.90), value: selectedTab)
+    }
+
+    private var tabSwitchTransition: AnyTransition {
+        .asymmetric(
+            insertion: .opacity.combined(with: .move(edge: .bottom)),
+            removal: .opacity.combined(with: .move(edge: .top))
+        )
+    }
+
+    private var preferredPanelHeightForSelectedTab: CGFloat {
+        switch selectedTab {
+        case .home:
+            if quickPromptMode == .chat && isCompactChatExpanded {
+                return homeAgentTaskSessions.isEmpty ? 620 : 680
+            }
+            if !homeAgentTaskSessions.isEmpty {
+                return quickPromptMode == .agent ? 620 : 560
+            }
+            if !quickPromptAttachments.isEmpty {
+                return 430
+            }
+            if hasHomeConversationActivity {
+                return 560
+            }
+            return 560
+        case .agents:
+            if expandedAgentSessionID != nil {
+                // Expanding an agent chat should reveal the session inside the
+                // existing main panel whenever possible. Keep the panel at the
+                // normal Agents-tab height and let the nested session scroller
+                // absorb long transcripts instead of forcing the whole panel
+                // taller on compact/short panel layouts.
+                return agentPanelSelection == .specialists ? 430 : 500
+            }
+            return agentPanelSelection == .specialists ? 430 : 500
+        case .connections:
+            return 710
+        case .settings:
+            return 520
+        }
+    }
+
+    @ViewBuilder
+    private var tabContent: some View {
+        switch selectedTab {
+        case .home:
+            homeTab
+        case .agents:
+            agentsTab
+        case .connections:
+            connectionsTab
+        case .settings:
+            settingsTab
+        }
+    }
+
+    private var topStatusRail: some View {
+        HStack(spacing: 7) {
+            Button {
+                selectedTab = .agents
+            } label: {
+                statusPill(
+                    title: runningAgentCount == 0 ? "Agents ready" : "\(runningAgentCount) running",
+                    systemImageName: "terminal.fill",
+                    color: runningAgentCount == 0 ? DS.Colors.textSecondary : DS.Colors.accentText
+                )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Show Odysseus agents")
+            .help("Show Odysseus agents")
+
+            statusPill(
+                title: companionManager.allPermissionsGranted ? "Permissions" : "Needs permissions",
+                systemImageName: companionManager.allPermissionsGranted ? "checkmark.shield.fill" : "exclamationmark.shield.fill",
+                color: companionManager.allPermissionsGranted ? .green : .orange
+            )
+
+            statusPill(
+                title: activeVoiceLabel,
+                systemImageName: activeVoiceIcon,
+                color: activeVoiceAccent
+            )
+
+            // Terminal-first backend family: Apple / Codex / Claude with auto-discovery.
+            OdysseusVoiceBackendSelector(companion: companionManager, style: .compact)
+                .help("Voice backend: Apple on-device, Codex, or Claude Agent SDK")
+        }
+        .padding(.leading, 2)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    }
+
+    private var tabStrip: some View {
+        HStack(spacing: 6) {
+            OdysseusPanelDragHandle()
+                .frame(width: 30, height: 30)
+                .accessibilityLabel("Drag Odysseus panel")
+                .help("Drag Odysseus panel")
+
+            ForEach(OdysseusNotchTab.primaryTabs) { tab in
+                Button {
+                    selectPrimaryTab(tab)
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: tab.systemImageName)
+                            .font(panelUIFont(size: 15, weight: .heavy))
+                        Text(tab.title)
+                            .font(panelUIFont(size: 10, weight: .heavy))
+                    }
+                    .foregroundColor(selectedTab == tab ? DS.Colors.textPrimary : DS.Colors.textSecondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(selectedTab == tab ? Color.white.opacity(0.12) : Color.white.opacity(0.045))
+                            .shadow(
+                                color: selectedTab == tab ? DS.Colors.accentText.opacity(0.20) : .clear,
+                                radius: selectedTab == tab ? 9 : 0,
+                                x: 0,
+                                y: 0
+                            )
+                    )
+                    .overlay(
+                        Capsule(style: .continuous)
+                            .stroke(selectedTab == tab ? Color.white.opacity(0.08) : Color.white.opacity(0.05), lineWidth: 1)
+                    )
+                    .contentShape(Capsule(style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .contentShape(Capsule(style: .continuous))
+                .accessibilityLabel("Show \(tab.title)")
+                .help("Show \(tab.title)")
+            }
+
+            panelChromeButton(
+                systemImageName: selectedTab == .settings ? "gearshape.fill" : "gearshape",
+                accessibilityLabel: "Open Odysseus panel settings"
+            ) {
+                selectedTab = .settings
+            }
+
+            panelChromeButton(
+                systemImageName: isPanelPinned ? "pin.slash.fill" : "pin.fill",
+                accessibilityLabel: isPanelPinned ? "Unpin Odysseus panel" : "Pin Odysseus panel"
+            ) {
+                let nextValue = !isPanelPinned
+                isPanelPinned = nextValue
+                setPanelPinned(nextValue)
+            }
+
+            panelChromeButton(
+                systemImageName: "xmark",
+                accessibilityLabel: "Close Odysseus panel",
+                action: closePanel
+            )
+        }
+        .frame(height: 32)
+        .transaction { transaction in
+            transaction.animation = nil
+        }
+    }
+
+
+    private func selectPrimaryTab(_ tab: OdysseusNotchTab) {
+        guard tab == .connections else {
+            selectedTab = tab
+            return
+        }
+
+        selectedTab = .connections
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+            notifyPanelSizeChanged()
+        }
+    }
+
+    private func panelChromeButton(systemImageName: String, accessibilityLabel: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImageName)
+                .font(panelUIFont(size: 13, weight: .heavy))
+                .foregroundColor(DS.Colors.textSecondary)
+                .frame(width: 30, height: 30)
+                .background(
+                    Circle()
+                        .fill(Color.white.opacity(0.055))
+                )
+                .overlay(
+                    Circle()
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
+        .help(accessibilityLabel)
+    }
+
+    private var homeTab: some View {
+        VStack(spacing: 12) {
+            OdysseusNotchHeroCard(
+                title: quickPromptMode.title,
+                subtitle: quickPromptMode.subtitle,
+                systemImageName: quickPromptMode.systemImageName,
+                accent: DS.Colors.accentText
+            ) {
+                VStack(spacing: 10) {
+                    if quickPromptMode == .chat && isCompactChatExpanded {
+                        compactChatPane
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    } else {
+                        homePromptSuggestions
+                    }
+
+                    if !homeAgentTaskSessions.isEmpty {
+                        homeAgentTaskChipRow
+                    }
+
+                    Spacer(minLength: 18)
+
+                    VStack(spacing: 9) {
+                        quickPromptField
+
+                        HStack(spacing: 8) {
+                            quickPromptModeButton(.ask)
+                            quickPromptModeButton(.agent)
+                            quickPromptModeButton(.chat)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            topStatusRail
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var homeAgentTaskChipRow: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                Image(systemName: "terminal.fill")
+                    .font(panelUIFont(size: 10, weight: .black))
+                    .foregroundColor(DS.Colors.accentText)
+                Text("Agent tasks")
+                    .font(panelUIFont(size: 10, weight: .heavy))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer(minLength: 0)
+            }
+
+            FlowLayout(spacing: 7, rowSpacing: 7) {
+                ForEach(Array(homeAgentTaskSessions.prefix(4))) { session in
+                    homeAgentTaskChip(session)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 15, style: .continuous).fill(Color.white.opacity(0.045)))
+        .overlay(RoundedRectangle(cornerRadius: 15, style: .continuous).stroke(Color.white.opacity(0.07), lineWidth: 1))
+    }
+
+    private func homeAgentTaskChip(_ session: CodexAgentSession) -> some View {
+        Button {
+            openAgentSessionFromHome(session)
+        } label: {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(agentStatusColor(for: session))
+                    .frame(width: 7, height: 7)
+                    .shadow(color: agentStatusColor(for: session).opacity(0.7), radius: 4, x: 0, y: 0)
+                Text(session.title)
+                    .font(appUIFont(size: max(9, subtextFontSize - 1), weight: .heavy))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .lineLimit(1)
+                Image(systemName: "chevron.right")
+                    .font(panelUIFont(size: 8, weight: .black))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 7)
+            .background(Capsule(style: .continuous).fill(Color.white.opacity(0.07)))
+            .overlay(Capsule(style: .continuous).stroke(agentStatusColor(for: session).opacity(0.22), lineWidth: 0.8))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Open agent chat for \(session.title)")
+        .help("Open \(session.title) in Agents")
+    }
+
+    private func openAgentSessionFromHome(_ session: CodexAgentSession) {
+        companionManager.selectCodexAgentSession(session.id)
+        agentPanelSelection = .sessions
+        agentSessionFilter = .active
+        expandedAgentSessionID = session.id
+        selectedTab = .agents
+        notifyPanelSizeChanged()
+    }
+
+    private var homePromptSuggestions: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: "lightbulb.fill")
+                    .font(panelUIFont(size: 11, weight: .black))
+                    .foregroundColor(DS.Colors.accentText)
+                Text("Suggestions")
+                    .font(panelUIFont(size: 10, weight: .heavy))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer(minLength: 0)
+            }
+
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 112), spacing: 7)], spacing: 7) {
+                ForEach(homeSuggestionItems) { suggestion in
+                    homeSuggestionButton(suggestion)
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 15, style: .continuous).fill(Color.white.opacity(0.045)))
+        .overlay(RoundedRectangle(cornerRadius: 15, style: .continuous).stroke(Color.white.opacity(0.07), lineWidth: 1))
+    }
+
+    private var homeSuggestionItems: [HomeSuggestionItem] {
+        let configured = skillDiscoveryStore.suggestions.prefix(2).map { suggestion in
+            HomeSuggestionItem(
+                id: "skill-\(suggestion.id)",
+                title: suggestion.chipTitle?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? suggestion.chipTitle! : suggestion.title,
+                systemImageName: suggestion.systemImage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? suggestion.systemImage! : skillDiscoverySuggestionIcon(for: suggestion),
+                prompt: suggestion.installPrompt,
+                mode: .agent,
+                opensSettings: false
+            )
+        }
+
+        let defaults = [
+            HomeSuggestionItem(
+                id: "summarise-screen",
+                title: "Summarise screen",
+                systemImageName: "rectangle.and.text.magnifyingglass",
+                prompt: OdysseusQuickActionPrompts.screen,
+                mode: .ask,
+                opensSettings: false
+            ),
+            HomeSuggestionItem(
+                id: "start-agent",
+                title: "Start an agent",
+                systemImageName: "terminal.fill",
+                prompt: "Look at the current Odysseus screen context and fix the visible issue.",
+                mode: .agent,
+                opensSettings: false
+            ),
+            HomeSuggestionItem(
+                id: "open-settings",
+                title: "Open settings",
+                systemImageName: "gearshape.fill",
+                prompt: nil,
+                mode: nil,
+                opensSettings: true
+            )
+        ]
+
+        return Array((configured + defaults).prefix(5))
+    }
+
+    private func homeSuggestionButton(_ suggestion: HomeSuggestionItem) -> some View {
+        Button {
+            applyHomeSuggestion(suggestion)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: suggestion.systemImageName)
+                    .font(panelUIFont(size: 10, weight: .black))
+                Text(suggestion.title)
+                    .font(panelUIFont(size: 9, weight: .heavy))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+            }
+            .foregroundColor(DS.Colors.textPrimary)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 7)
+            .background(Capsule(style: .continuous).fill(Color.white.opacity(0.065)))
+            .overlay(Capsule(style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(suggestion.title)
+        .help(suggestion.title)
+    }
+
+    private func applyHomeSuggestion(_ suggestion: HomeSuggestionItem) {
+        if suggestion.opensSettings {
+            selectedTab = .settings
+            return
+        }
+        if let mode = suggestion.mode {
+            if quickPromptMode != mode {
+                suppressNextHomeSuggestionResize = true
+            }
+            quickPromptMode = mode
+        }
+        quickPrompt = suggestion.prompt ?? suggestion.title
+        focusQuickPromptIfHome()
+    }
+
+    private var agentsTab: some View {
+        VStack(spacing: 8) {
+            agentPanelSelector
+
+            switch agentPanelSelection {
+            case .sessions:
+                agentSessionsPanel
+            case .specialists:
+                specialistAgentGrid
+                    .frame(maxHeight: .infinity, alignment: .top)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private var agentPanelSelector: some View {
+        HStack(spacing: 8) {
+            agentPanelSelectorButton(
+                selection: .sessions,
+                title: "Sessions",
+                value: "\(visibleAgentSessionCount)",
+                detail: "\(runningAgentCount) running now",
+                color: DS.Colors.accentText,
+                systemImageName: "rectangle.stack.fill"
+            )
+            agentPanelSelectorButton(
+                selection: .specialists,
+                title: "Specialists",
+                value: "\(agentStore.agents.count)",
+                detail: "tap a card to launch",
+                color: .purple,
+                systemImageName: "person.2.badge.gearshape.fill"
+            )
+        }
+    }
+
+    private func agentPanelSelectorButton(
+        selection: OdysseusAgentPanelSelection,
+        title: String,
+        value: String,
+        detail: String,
+        color: Color,
+        systemImageName: String
+    ) -> some View {
+        Button {
+            agentPanelSelection = selection
+            if selection == .specialists {
+                expandedAgentSessionID = nil
+            }
+            notifyPanelSizeChanged()
+        } label: {
+            OdysseusNotchMetricCard(
+                title: title,
+                value: value,
+                detail: detail,
+                color: color,
+                systemImageName: systemImageName,
+                isSelected: agentPanelSelection == selection
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Show Odysseus \(title.lowercased())")
+        .help("Show \(title)")
+    }
+
+    private var agentSessionsPanel: some View {
+        GeometryReader { geometry in
+            VStack(spacing: 8) {
+                agentSessionContent
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: visibleAgentSessions.isEmpty ? .center : .top)
+
+                agentsFooter
+                    .frame(maxWidth: .infinity, alignment: .bottom)
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .bottom)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    @ViewBuilder
+    private var agentSessionContent: some View {
+        if visibleAgentSessions.isEmpty {
+            OdysseusNotchEmptyState(
+                systemImageName: agentSessionFilter.emptyStateSystemImageName,
+                title: agentSessionFilter.emptyStateTitle,
+                subtitle: agentSessionFilter.emptyStateSubtitle
+            )
+        } else {
+            agentSessionScrollView
+        }
+    }
+
+    private var agentSessionScrollView: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: true) {
+                agentSessionRows
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .onChange(of: expandedAgentSessionID) { _, sessionID in
+                guard let sessionID else { return }
+                DispatchQueue.main.async {
+                    withAnimation(.easeOut(duration: 0.20)) {
+                        proxy.scrollTo(sessionID, anchor: .top)
+                    }
+                }
+            }
+        }
+    }
+
+    private var agentSessionRows: some View {
+        VStack(spacing: 6) {
+            ForEach(visibleAgentSessions) { session in
+                agentRow(session)
+                    .id(session.id)
+            }
+        }
+        .padding(.trailing, 2)
+    }
+
+    private var specialistAgentGrid: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                Image(systemName: "square.grid.2x2.fill")
+                    .font(panelUIFont(size: 12, weight: .black))
+                    .foregroundColor(.purple.opacity(0.9))
+                Text("Specialist agents")
+                    .font(panelUIFont(size: 10, weight: .heavy))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer(minLength: 0)
+                Text("Tap to start")
+                    .font(panelUIFont(size: 9, weight: .heavy))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+
+            if agentStore.agents.isEmpty {
+                Text("No specialist agents are installed yet.")
+                    .font(panelUIFont(size: 10, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.white.opacity(0.045)))
+            } else {
+                ScrollView(.vertical, showsIndicators: agentStore.agents.count > 6) {
+                    LazyVGrid(
+                        columns: [
+                            GridItem(.flexible(), spacing: 7),
+                            GridItem(.flexible(), spacing: 7)
+                        ],
+                        spacing: 7
+                    ) {
+                        ForEach(agentStore.agents) { agent in
+                            specialistAgentTile(agent)
+                        }
+                    }
+                }
+                .frame(maxHeight: 150)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.white.opacity(0.045)))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color.white.opacity(0.065), lineWidth: 1))
+    }
+
+    private func specialistAgentTile(_ agent: OdysseusAgentDefinition) -> some View {
+        let accent = specialistAgentAccentColor(agent)
+        return Button {
+            Task { @MainActor in
+                await Task.yield()
+                let session = companionManager.createAndSelectNewCodexAgentSession(asAgent: agent)
+                agentPanelSelection = .sessions
+                expandedAgentSessionID = nil
+                agentSessionFilter = .active
+                companionManager.selectCodexAgentSession(session.id)
+                notifyPanelSizeChanged()
+            }
+        } label: {
+            HStack(spacing: 8) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(accent.opacity(0.16))
+                    Image(systemName: agent.isUserDefined ? "person.crop.circle.fill.badge.checkmark" : "gearshape.fill")
+                        .font(panelUIFont(size: 15, weight: .black))
+                        .foregroundColor(accent)
+                }
+                .frame(width: 34, height: 34)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(agent.metadata.displayName)
+                        .font(panelUIFont(size: 11, weight: .heavy))
+                        .foregroundColor(DS.Colors.textPrimary)
+                        .lineLimit(1)
+                    Text(agent.metadata.description.isEmpty ? agent.slug : agent.metadata.description)
+                        .font(panelUIFont(size: 9, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(Color.white.opacity(0.058)))
+            .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).stroke(accent.opacity(0.20), lineWidth: 0.8))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Start \(agent.metadata.displayName) specialist agent")
+        .help("Start \(agent.metadata.displayName)")
+    }
+
+    private func specialistAgentAccentColor(_ agent: OdysseusAgentDefinition) -> Color {
+        guard let hex = agent.metadata.accentColorHex?.trimmingCharacters(in: CharacterSet(charactersIn: "# \n\t")),
+              hex.count == 6,
+              let value = Int(hex, radix: 16) else {
+            return agent.isUserDefined ? DS.Colors.accentText : .purple
+        }
+
+        return Color(
+            red: Double((value >> 16) & 0xff) / 255.0,
+            green: Double((value >> 8) & 0xff) / 255.0,
+            blue: Double(value & 0xff) / 255.0
+        )
+    }
+
+    private var agentsFooter: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 6) {
+                ForEach(OdysseusAgentSessionFilter.allCases) { filter in
+                    agentFilterButton(filter)
+                }
+            }
+
+            HStack(spacing: 8) {
+                secondaryActionButton(title: "New Request", systemImageName: "plus.message.fill") {
+                    selectedTab = .home
+                }
+
+                if !completedUnarchivedAgentSessions.isEmpty {
+                    secondaryActionButton(title: "Archive done", systemImageName: "archivebox.fill") {
+                        archiveCompletedAgentSessions()
+                    }
+                }
+
+                agentUtilityIconButton(
+                    systemImageName: "books.vertical",
+                    accessibilityLabel: "Open Odysseus memory browser"
+                ) {
+                    companionManager.showMemoryWindow()
+                }
+
+                agentUtilityIconButton(
+                    systemImageName: "doc.text",
+                    accessibilityLabel: "Open Odysseus memory file"
+                ) {
+                    companionManager.openOdysseusDocument(companionManager.codexHomeManager.persistentMemoryFile)
+                }
+
+                agentUtilityIconButton(
+                    systemImageName: "wand.and.stars",
+                    accessibilityLabel: "Open Odysseus learned skills folder"
+                ) {
+                    NSWorkspace.shared.open(companionManager.codexHomeManager.learnedSkillsDirectory)
+                }
+            }
+        }
+    }
+
+    private func agentFilterButton(_ filter: OdysseusAgentSessionFilter) -> some View {
+        let isSelected = agentSessionFilter == filter
+        let count = companionManager.codexAgentSessions.filter { session in
+            shouldShowAgentSessionInPanel(session) &&
+            filter.includes(session: session, archivedSessionIDs: companionManager.archivedSessionIDs)
+        }.count
+
+        return Button {
+            agentSessionFilter = filter
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: filter.systemImageName)
+                    .font(panelUIFont(size: 13, weight: .black))
+                Text("\(count)")
+                    .font(appUIFont(size: max(9, subtextFontSize - 2), weight: .heavy))
+                    .monospacedDigit()
+            }
+            .foregroundColor(isSelected ? DS.Colors.textOnAccent : DS.Colors.textSecondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(isSelected ? DS.Colors.accent.opacity(0.95) : Color.white.opacity(0.065))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(isSelected ? DS.Colors.accentText.opacity(0.42) : Color.white.opacity(0.08), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(filter.accessibilityLabel)
+        .help(filter.title)
+    }
+
+    private func archiveCompletedAgentSessions() {
+        let sessionIDs = completedUnarchivedAgentSessions.map(\.id)
+        withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+            if let expandedAgentSessionID,
+               sessionIDs.contains(expandedAgentSessionID) {
+                self.expandedAgentSessionID = nil
+            }
+            sessionIDs.forEach { companionManager.archiveSession($0) }
+            if agentSessionFilter == .completed {
+                agentSessionFilter = .active
+            }
+        }
+    }
+
+    private func isAgentSessionRunning(_ session: CodexAgentSession) -> Bool {
+        switch session.status {
+        case .starting, .running:
+            return true
+        case .stopped, .ready, .failed:
+            return session.isTurnActiveForChatQueue
+        }
+    }
+
+    private func requestArchiveAgentSession(_ session: CodexAgentSession) {
+        guard !isAgentSessionRunning(session) else {
+            pendingStopAgentSessionID = session.id
+            return
+        }
+        guard session.isFinishedForArchive else {
+            pendingArchiveAgentSessionID = session.id
+            return
+        }
+        archiveAgentSession(session.id, allowIncomplete: false)
+    }
+
+    private func archiveAgentSession(_ sessionID: UUID, allowIncomplete: Bool) {
+        withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+            if expandedAgentSessionID == sessionID {
+                expandedAgentSessionID = nil
+            }
+            companionManager.archiveSession(sessionID, allowIncomplete: allowIncomplete)
+        }
+    }
+
+    private func confirmArchivePendingAgentSession() {
+        guard let sessionID = pendingArchiveAgentSessionID else { return }
+        pendingArchiveAgentSessionID = nil
+        archiveAgentSession(sessionID, allowIncomplete: true)
+    }
+
+    private func confirmStopPendingAgentSession() {
+        guard let sessionID = pendingStopAgentSessionID else { return }
+        pendingStopAgentSessionID = nil
+        withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+            companionManager.selectCodexAgentSession(sessionID)
+            companionManager.stopCodexAgentSession(sessionID, reason: "agent_panel_stop")
+        }
+    }
+
+    private func resumeAgentSessionAfterRelaunch(_ session: CodexAgentSession) {
+        withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+            companionManager.selectCodexAgentSession(session.id)
+            expandedAgentSessionID = session.id
+            session.resumeInterruptedTaskAfterRelaunch()
+            notifyPanelSizeChanged()
+        }
+    }
+
+    private func agentUtilityIconButton(systemImageName: String, accessibilityLabel: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImageName)
+                .font(panelUIFont(size: 14, weight: .black))
+                .foregroundColor(DS.Colors.textPrimary)
+                .frame(width: 34, height: 34)
+                .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(Color.white.opacity(0.07)))
+                .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).stroke(Color.white.opacity(0.09), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
+        .help(accessibilityLabel)
+    }
+
+    private var connectionsTab: some View {
+        ScrollView(.vertical, showsIndicators: true) {
+            VStack(spacing: 10) {
+                OdysseusNotchEmptyState(
+                    systemImageName: "point.3.connected.trianglepath.dotted",
+                    title: "Connections",
+                    subtitle: "Use Agent Mode skills for Notion, GitHub, mail, browser, files, and app workflows. No hosted sync required."
+                )
+                skillDiscoveryPanel
+                VStack(spacing: 7) {
+                    ForEach(connectionRows) { row in
+                        connectionRow(row)
+                    }
+                }
+                primaryActionButton(title: "Open settings", systemImageName: "gearshape.fill") {
+                    companionManager.showSettingsWindow()
+                }
+            }
+            .padding(.bottom, 2)
+        }
+        .frame(maxHeight: 590, alignment: .top)
+        .onAppear {
+            automationStore.ensureSkillDiscoveryAutomationInstalled()
+            skillDiscoveryStore.reload()
+        }
+    }
+
+    private var skillDiscoveryPanel: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles.rectangle.stack.fill")
+                    .font(panelUIFont(size: 15, weight: .black))
+                    .foregroundColor(DS.Colors.accentText)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("App skill discovery")
+                        .font(panelUIFont(size: 12, weight: .heavy))
+                        .foregroundColor(DS.Colors.textPrimary)
+                    Text(skillDiscoveryStatusText)
+                        .font(panelUIFont(size: 10, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                        .lineLimit(2)
+                }
+                Spacer(minLength: 0)
+            }
+
+            HStack(spacing: 8) {
+                secondaryActionButton(title: "Run now", systemImageName: "play.fill") {
+                    runSkillDiscoveryNow()
+                }
+                secondaryActionButton(title: "Open skills", systemImageName: "folder.fill") {
+                    NSWorkspace.shared.open(companionManager.codexHomeManager.learnedSkillsDirectory)
+                }
+            }
+
+            if skillDiscoveryStore.suggestions.isEmpty {
+                Text("Odysseus will populate this with local and online skill matches after the scheduled pass runs.")
+                    .font(panelUIFont(size: 10, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(9)
+                    .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.white.opacity(0.045)))
+            } else {
+                VStack(spacing: 7) {
+                    ForEach(skillDiscoveryStore.suggestions) { suggestion in
+                        skillDiscoverySuggestionRow(suggestion)
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.white.opacity(0.055)))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(DS.Colors.accentText.opacity(0.14), lineWidth: 1))
+    }
+
+    private var skillDiscoveryStatusText: String {
+        guard let automation = automationStore.skillDiscoveryAutomation else {
+            return "Preconfigured schedule will be added automatically."
+        }
+        let enabled = automation.enabled ? "enabled" : "paused"
+        if let appName = skillDiscoveryStore.activeApplicationName, !appName.isEmpty {
+            return "\(enabled) · tuned for \(appName)"
+        }
+        if let next = automation.nextRun, automation.enabled {
+            return "\(enabled) · next \(next.formatted(.dateTime.weekday().hour().minute()))"
+        }
+        return "\(enabled) · \(automation.schedule.displayString)"
+    }
+
+    private func skillDiscoverySuggestionRow(_ suggestion: OdysseusSkillDiscoverySuggestion) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: skillDiscoverySuggestionIcon(for: suggestion))
+                .font(panelUIFont(size: 13, weight: .black))
+                .foregroundColor(DS.Colors.accentText)
+                .frame(width: 28, height: 28)
+                .background(Circle().fill(DS.Colors.accentText.opacity(0.12)))
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(suggestion.title)
+                        .font(panelUIFont(size: 11, weight: .heavy))
+                        .foregroundColor(DS.Colors.textPrimary)
+                        .lineLimit(1)
+                    Text(suggestion.sourceLabel)
+                        .font(panelUIFont(size: 8, weight: .black))
+                        .foregroundColor(DS.Colors.accentText)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Capsule(style: .continuous).fill(DS.Colors.accentText.opacity(0.12)))
+                }
+                Text(suggestion.detail)
+                    .font(panelUIFont(size: 9, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 4)
+
+            Button {
+                installSkillSuggestion(suggestion)
+            } label: {
+                Text(suggestion.actionLabel)
+                    .font(panelUIFont(size: 9, weight: .heavy))
+                    .foregroundColor(DS.Colors.textOnAccent)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(Capsule(style: .continuous).fill(DS.Colors.accent))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(suggestion.actionLabel) \(suggestion.title)")
+            .help("Start an Odysseus agent to \(suggestion.actionLabel.lowercased()) \(suggestion.title)")
+        }
+        .padding(9)
+        .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(Color.white.opacity(0.052)))
+        .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).stroke(Color.white.opacity(0.065), lineWidth: 1))
+    }
+
+    private func skillDiscoverySuggestionIcon(for suggestion: OdysseusSkillDiscoverySuggestion) -> String {
+        switch suggestion.source.lowercased() {
+        case "online":
+            return "globe"
+        case "mcp":
+            return "point.3.connected.trianglepath.dotted"
+        case "app":
+            return "app.fill"
+        default:
+            return "wand.and.stars"
+        }
+    }
+
+    private func runSkillDiscoveryNow() {
+        Task { @MainActor in
+            await Task.yield()
+            automationStore.ensureSkillDiscoveryAutomationInstalled()
+            if let agent = agentStore.agent(slug: OdysseusAgentStore.skillDiscoveryAgentSlug) {
+                let session = companionManager.createAndSelectNewCodexAgentSession(asAgent: agent)
+                session.submitPromptFromUI(OdysseusAutomationStore.skillDiscoveryAutomationPrompt, screenContext: nil)
+            } else {
+                companionManager.submitAgentPromptFromUI(OdysseusAutomationStore.skillDiscoveryAutomationPrompt)
+            }
+        }
+    }
+
+    private func installSkillSuggestion(_ suggestion: OdysseusSkillDiscoverySuggestion) {
+        let prompt = suggestion.installPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        companionManager.submitNewAgentTaskFromUI(
+            prompt.isEmpty ? "Install or connect the \(suggestion.title) skill for Odysseus Agent Mode, preserving local skill and memory rules." : prompt,
+            source: "open_odysseus_connect_tab"
+        )
+        notifyPanelSizeChanged()
+    }
+
+    private var settingsTab: some View {
+        VStack(spacing: 10) {
+            cursorBuddySection
+            cursorColorSection
+
+            primaryActionButton(title: "Full settings", systemImageName: "gearshape.fill") {
+                companionManager.showSettingsWindow()
+            }
+        }
+    }
+
+    private var quickPromptField: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            if !quickPromptAttachments.isEmpty {
+                attachmentChipRow(attachments: quickPromptAttachments, remove: removeQuickPromptAttachment)
+            }
+
+            OdysseusPromptAutocompletePanel(options: quickPromptAutocompleteOptions) { option in
+                OdysseusPromptAutocomplete.apply(option, to: &quickPrompt)
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: quickPromptMode.fieldSystemImageName)
+                    .font(panelUIFont(size: 15, weight: .bold))
+                    .foregroundColor(DS.Colors.accentText)
+                TextField(quickPromptAttachments.isEmpty ? quickPromptMode.placeholder : "Ask about the attachment…", text: $quickPrompt, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(panelUIFont(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .lineLimit(1...5)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .focused($isQuickPromptFocused)
+                    .submitLabel(.send)
+                    .onSubmit { submitQuickPromptFromKeyboard() }
+                    .onKeyPress(.return, phases: .down) { keyPress in
+                        if keyPress.modifiers.contains(.shift) {
+                            return .ignored
+                        }
+                        submitQuickPromptFromKeyboard()
+                        return .handled
+                    }
+                    .onKeyPress(.tab, phases: .down) { _ in
+                        OdysseusPromptAutocomplete.acceptFirstOption(
+                            in: &quickPrompt,
+                            agents: agentStore.agents,
+                            skillSuggestions: skillDiscoveryStore.suggestions
+                        ) ? .handled : .ignored
+                    }
+                    .onKeyPress("v", phases: .down) { keyPress in
+                        guard keyPress.modifiers.contains(.command) else { return .ignored }
+                        return pasteQuickPromptAttachmentsFromClipboard() ? .handled : .ignored
+                    }
+                Button(action: submitQuickPrompt) {
+                    Image(systemName: "paperplane.fill")
+                        .font(panelUIFont(size: 13, weight: .black))
+                        .foregroundColor(DS.Colors.textOnAccent)
+                        .frame(width: 34, height: 30)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(LinearGradient(colors: [DS.Colors.accent, DS.Colors.accentHover], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    )
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.return, modifiers: [])
+                .accessibilityLabel("Send Odysseus prompt")
+                .help("Send Odysseus prompt")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.black.opacity(0.28)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(isQuickPromptDropTargeted ? DS.Colors.accentText.opacity(0.55) : Color.white.opacity(0.08), lineWidth: isQuickPromptDropTargeted ? 1.2 : 1)
+        )
+        .overlay {
+            if isQuickPromptDropTargeted {
+                dropTargetOverlay
+            }
+        }
+        .onDrop(
+            of: Self.supportedAttachmentDropTypes,
+            isTargeted: $isQuickPromptDropTargeted
+        ) { providers in
+            handleAttachmentDrop(providers) { url, kind in
+                addQuickPromptAttachment(url, forcedKind: kind)
+            }
+        }
+        .animation(.easeOut(duration: 0.16), value: isQuickPromptDropTargeted)
+    }
+
+    private var compactChatPane: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: true) {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    if compactChatEntries.isEmpty {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Chat stays here")
+                                .font(panelUIFont(size: 12, weight: .heavy))
+                                .foregroundColor(DS.Colors.textPrimary)
+                            Text("Type or speak while Chat is selected; Home mirrors the active Ask Agent chat.")
+                                .font(panelUIFont(size: 10, weight: .semibold))
+                                .foregroundColor(DS.Colors.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.white.opacity(0.045)))
+                    } else {
+                        ForEach(compactChatEntries) { entry in
+                            compactChatBubble(entry)
+                                .id(entry.id)
+                        }
+                    }
+
+                    if isHomeChatBusy {
+                        HStack(spacing: 7) {
+                            ProgressView()
+                                .controlSize(.small)
+                                .scaleEffect(0.72)
+                            Text(activeVoiceLabel)
+                                .font(appUIFont(size: max(10, subtextFontSize), weight: .heavy))
+                                .foregroundColor(DS.Colors.textSecondary)
+                        }
+                        .padding(.horizontal, max(9, bodyFontSize * 0.75))
+                        .padding(.vertical, max(7, bodyFontSize * 0.52))
+                        .background(Capsule(style: .continuous).fill(Color.white.opacity(0.055)))
+                        .id("compact-chat-status")
+                    }
+                }
+                .padding(9)
+            }
+            .frame(maxHeight: 238)
+            .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color.black.opacity(0.22)))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+            )
+            .onChange(of: companionManager.codexAgentSession.entries.count) {
+                let targetID = compactChatEntries.last?.id ?? (isHomeChatBusy ? "compact-chat-status" : nil)
+                guard let targetID else { return }
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    proxy.scrollTo(targetID, anchor: .bottom)
+                }
+            }
+        }
+    }
+
+    private func compactChatBubble(_ entry: CodexTranscriptEntry) -> some View {
+        let isUser = entry.role == .user
+        return HStack(alignment: .top, spacing: 0) {
+            if isUser { Spacer(minLength: 36) }
+            VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
+                Text(compactChatRoleLabel(for: entry.role))
+                    .font(appUIFont(size: max(9, subtextFontSize - 2), weight: .black))
+                    .foregroundColor(compactChatRoleColor(for: entry.role))
+                Text(entry.text)
+                    .font(appUIFont(size: max(11, bodyFontSize - 1), weight: .medium))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, max(9, bodyFontSize * 0.82))
+            .padding(.vertical, max(8, bodyFontSize * 0.66))
+            .background(RoundedRectangle(cornerRadius: max(13, bodyFontSize + 2), style: .continuous).fill(compactChatBubbleColor(for: entry.role)))
+            .overlay(RoundedRectangle(cornerRadius: max(13, bodyFontSize + 2), style: .continuous).stroke(Color.white.opacity(0.07), lineWidth: 0.5))
+            if !isUser { Spacer(minLength: 36) }
+        }
+        .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+    }
+
+    func compactChatDisplayText(from rawText: String) -> String {
+        var text = rawText
+        text = text.replacingOccurrences(of: #"(?s)<NEXT_ACTIONS>.*?</NEXT_ACTIONS>"#, with: " ", options: .regularExpression)
+        text = text.replacingOccurrences(of: #"(?m)^TASK_TITLE:.*$"#, with: " ", options: .regularExpression)
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func compactChatRoleLabel(for role: CodexTranscriptEntry.Role) -> String {
+        switch role {
+        case .user: return "You"
+        case .assistant: return "Odysseus"
+        case .system: return "System"
+        case .command: return "Tool"
+        case .plan: return "Plan"
+        }
+    }
+
+    private func compactChatRoleColor(for role: CodexTranscriptEntry.Role) -> Color {
+        switch role {
+        case .user: return DS.Colors.accentText
+        case .assistant: return .green
+        case .system: return .orange
+        case .command: return .yellow
+        case .plan: return .purple
+        }
+    }
+
+    private func compactChatBubbleColor(for role: CodexTranscriptEntry.Role) -> Color {
+        switch role {
+        case .user: return DS.Colors.accent.opacity(0.16)
+        case .assistant: return Color.white.opacity(0.07)
+        case .system: return .orange.opacity(0.10)
+        case .command: return .yellow.opacity(0.08)
+        case .plan: return .purple.opacity(0.10)
+        }
+    }
+
+    @ViewBuilder
+    private func quickPromptModeButton(_ mode: OdysseusQuickPromptMode) -> some View {
+        let action = {
+            withAnimation(.spring(response: 0.2, dampingFraction: 0.86)) {
+                quickPromptMode = mode
+                if mode != .chat {
+                    isCompactChatExpanded = false
+                }
+            }
+        }
+
+        if quickPromptMode == mode {
+            primaryActionButton(title: mode.buttonTitle, systemImageName: mode.buttonSystemImageName, action: action)
+        } else {
+            secondaryActionButton(title: mode.buttonTitle, systemImageName: mode.buttonSystemImageName, action: action)
+        }
+    }
+
+    private func syncHomeChatMode(source: String) {
+        companionManager.setHomeChatModeActive(selectedTab == .home && quickPromptMode == .chat, source: source)
+    }
+
+    private func syncCompactChatVisibility() {
+        guard quickPromptMode == .chat else { return }
+        if !compactChatEntries.isEmpty || isHomeChatBusy {
+            isCompactChatExpanded = true
+        }
+    }
+
+    private var currentCursorAvatarStyle: OdysseusCursorAvatarStyle {
+        OdysseusCursorAvatarStyle(storageValue: avatarStyleRawValue)
+    }
+
+    private var shouldShowCursorColorSection: Bool {
+        switch currentCursorAvatarStyle {
+        case .triangleFilled, .triangleOutline:
+            return true
+        case .pet:
+            return false
+        }
+    }
+
+    private var cursorBuddySection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("Cursor buddy")
+                    .font(panelUIFont(size: 12, weight: .heavy))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer()
+                Button(action: { presentHatchSheet() }) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "sparkles")
+                            .font(panelUIFont(size: 12, weight: .semibold))
+                        Text("Hatch new")
+                            .font(panelUIFont(size: 10, weight: .heavy))
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.white.opacity(0.07)))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.white.opacity(0.10), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Colors.textSecondary)
+                .accessibilityLabel("Hatch a new cursor buddy")
+                .help("Hatch a new cursor buddy")
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    avatarTile(.triangleFilled, label: "Triangle")
+                    avatarTile(.triangleOutline, label: "Outline")
+                    ForEach(petLibrary.pets) { pet in
+                        avatarTileForPet(pet)
+                    }
+                    if petLibrary.pets.isEmpty {
+                        emptyBuddiesHintTile
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text("Buddy size")
+                        .font(panelUIFont(size: 10, weight: .heavy))
+                        .foregroundColor(DS.Colors.textSecondary)
+                    Spacer()
+                    Text("\(Int((cursorAvatarSizeScale * 100).rounded()))%")
+                        .font(panelUIFont(size: 10, weight: .heavy))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+
+                Slider(
+                    value: $cursorAvatarSizeScale,
+                    in: OdysseusCursorAvatarSizePreference.minScale...OdysseusCursorAvatarSizePreference.maxScale
+                )
+                .controlSize(.small)
+                .tint((OdysseusAccentTheme(rawValue: selectedAccentThemeID) ?? .blue).cursorColor)
+            }
+        }
+    }
+
+    private var cursorColorSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Cursor color")
+                .font(panelUIFont(size: 12, weight: .heavy))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            LazyVGrid(columns: cursorColorGridColumns, spacing: 6) {
+                ForEach(cursorColorThemeOrder) { accentTheme in
+                    cursorColorButton(accentTheme)
+                }
+            }
+        }
+    }
+
+    private var emptyBuddiesHintTile: some View {
+        Button(action: { presentHatchSheet() }) {
+            VStack(spacing: 2) {
+                Image(systemName: "plus")
+                    .font(panelUIFont(size: 15, weight: .semibold))
+                    .foregroundColor(DS.Colors.textTertiary)
+                Text("Hatch")
+                    .font(panelUIFont(size: 9, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+            .frame(width: 62, height: 44)
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(DS.Colors.borderSubtle, style: StrokeStyle(lineWidth: 0.8, dash: [3, 3])))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Hatch a new cursor buddy")
+        .help("Hatch a new cursor buddy")
+    }
+
+    private func avatarTile(_ style: OdysseusCursorAvatarStyle, label: String) -> some View {
+        let isSelected = currentCursorAvatarStyle == style
+        let accent = (OdysseusAccentTheme(rawValue: selectedAccentThemeID) ?? .blue).cursorColor
+
+        return Button(action: { avatarStyleRawValue = style.storageValue }) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(isSelected ? accent.opacity(0.16) : Color.white.opacity(0.055))
+
+                Group {
+                    switch style {
+                    case .triangleFilled:
+                        Triangle()
+                            .fill(accent)
+                            .frame(width: 18, height: 18)
+                            .rotationEffect(.degrees(-25))
+                            .shadow(color: accent.opacity(0.72), radius: 8)
+                    case .triangleOutline:
+                        Triangle()
+                            .stroke(accent, lineWidth: 2.5)
+                            .frame(width: 18, height: 18)
+                            .rotationEffect(.degrees(-25))
+                    case .pet:
+                        EmptyView()
+                    }
+                }
+            }
+            .frame(width: 62, height: 44)
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(isSelected ? accent : DS.Colors.borderSubtle, lineWidth: isSelected ? 1.7 : 0.7))
+        }
+        .buttonStyle(.plain)
+        .help(label)
+    }
+
+    private func avatarTileForPet(_ pet: OdysseusBuddyPet) -> some View {
+        let style = OdysseusCursorAvatarStyle.pet(id: pet.id)
+        let isSelected = currentCursorAvatarStyle == style
+        let accent = (OdysseusAccentTheme(rawValue: selectedAccentThemeID) ?? .blue).cursorColor
+
+        return Button(action: { avatarStyleRawValue = style.storageValue }) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(isSelected ? accent.opacity(0.16) : Color.white.opacity(0.055))
+                OdysseusPetThumbnailView(pet: pet)
+                    .frame(width: 34, height: 36)
+            }
+            .frame(width: 62, height: 44)
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(isSelected ? accent : DS.Colors.borderSubtle, lineWidth: isSelected ? 1.7 : 0.7))
+        }
+        .buttonStyle(.plain)
+        .help(pet.displayName)
+    }
+
+    private var cursorColorThemeOrder: [OdysseusAccentTheme] {
+        [.rose, .orange, .amber, .lime, .mint, .cyan, .blue, .violet, .white]
+    }
+
+    private var cursorColorGridColumns: [GridItem] {
+        [GridItem(.adaptive(minimum: 64), spacing: 6)]
+    }
+
+    private func cursorColorButton(_ accentTheme: OdysseusAccentTheme) -> some View {
+        let isSelected = selectedAccentThemeID == accentTheme.rawValue
+        return Button(action: { selectedAccentThemeID = accentTheme.rawValue }) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(isSelected ? accentTheme.cursorColor.opacity(0.16) : Color.white.opacity(0.055))
+                Triangle()
+                    .fill(accentTheme.cursorColor)
+                    .frame(width: 18, height: 18)
+                    .rotationEffect(.degrees(-25))
+                    .shadow(color: accentTheme.cursorColor.opacity(0.72), radius: 8)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 44)
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(isSelected ? accentTheme.cursorColor : DS.Colors.borderSubtle, lineWidth: isSelected ? 1.7 : 0.7))
+        }
+        .buttonStyle(.plain)
+        .help(accentTheme.title)
+    }
+
+    private func presentHatchSheet() {
+        hatchPetName = ""
+        hatchPetDescription = ""
+        isShowingHatchSheet = true
+    }
+
+    private var hatchPetSheet: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Hatch a new buddy")
+                .font(panelUIFont(size: 14, weight: .semibold))
+            Text("Launches an Agent Mode hatch-pet session.")
+                .font(panelUIFont(size: 11))
+                .foregroundColor(DS.Colors.textSecondary)
+            TextField("Name", text: $hatchPetName)
+                .textFieldStyle(.roundedBorder)
+            TextField("Description optional", text: $hatchPetDescription)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                Spacer()
+                Button("Cancel") { isShowingHatchSheet = false }
+                    .help("Cancel buddy hatch")
+                Button("Hatch") {
+                    let theme = OdysseusAccentTheme(rawValue: selectedAccentThemeID) ?? .blue
+                    _ = OdysseusPetHatchCoordinator.shared.beginHatch(
+                        name: hatchPetName,
+                        description: hatchPetDescription,
+                        accentTheme: theme,
+                        companionManager: companionManager
+                    )
+                    isShowingHatchSheet = false
+                }
+                .disabled(hatchPetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .help("Start hatching this buddy")
+            }
+        }
+        .padding(16)
+        .frame(width: 360)
+    }
+
+    private var permissionProgressStrip: some View {
+        let permissions: [(String, Bool)] = [
+            ("AX", companionManager.hasAccessibilityPermission),
+            ("Screen", companionManager.hasScreenRecordingPermission),
+            ("Mic", companionManager.hasMicrophonePermission),
+            ("Content", companionManager.hasScreenContentPermission)
+        ]
+
+        return HStack(spacing: 7) {
+            ForEach(permissions, id: \.0) { permission in
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(permission.1 ? Color.green : Color.orange)
+                        .frame(width: 6, height: 6)
+                    Text(permission.0)
+                        .font(panelUIFont(size: 9, weight: .heavy))
+                        .foregroundColor(permission.1 ? DS.Colors.textPrimary : DS.Colors.textSecondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 7)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.white.opacity(permission.1 ? 0.075 : 0.045))
+                )
+            }
+        }
+    }
+
+    private func agentRow(_ session: CodexAgentSession) -> some View {
+        let isExpanded = expandedAgentSessionID == session.id
+        let isArchived = companionManager.archivedSessionIDs.contains(session.id)
+        let isRunning = isAgentSessionRunning(session)
+        let canResume = !isArchived && session.canResumeAfterRelaunch
+        let canStop = !isArchived && isRunning
+        let canArchive = !isArchived && !isRunning && !canResume
+        let showsTerminalControl = canResume || canStop || canArchive || isArchived
+        return VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Button {
+                    companionManager.selectCodexAgentSession(session.id)
+                    withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+                        expandedAgentSessionID = isExpanded ? nil : session.id
+                    }
+                } label: {
+                    HStack(spacing: 10) {
+                        if isRunning {
+                            OdysseusRunningAgentIndicator(color: agentStatusColor(for: session))
+                                .frame(width: 18, height: 10, alignment: .center)
+                        } else {
+                            Circle()
+                                .fill(agentStatusColor(for: session))
+                                .frame(width: 8, height: 8)
+                                .shadow(color: agentStatusColor(for: session).opacity(0.7), radius: 5, x: 0, y: 0)
+                                .frame(width: 18, height: 10, alignment: .center)
+                        }
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(session.title)
+                                .font(panelUIFont(size: 12, weight: .heavy))
+                                .foregroundColor(DS.Colors.textPrimary)
+                                .lineLimit(1)
+
+                            Text(session.latestActivityDisplaySummary ?? session.statusSummaryLine)
+                                .font(panelUIFont(size: 10, weight: .medium))
+                                .foregroundColor(DS.Colors.textSecondary)
+                                .lineLimit(1)
+                        }
+
+                        Spacer(minLength: 8)
+                        Text(agentStatusLabel(for: session))
+                            .font(appUIFont(size: max(9, subtextFontSize - 2), weight: .black))
+                            .foregroundColor(agentStatusColor(for: session))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .padding(.horizontal, max(6, subtextFontSize * 0.58))
+                            .padding(.vertical, max(3, subtextFontSize * 0.28))
+                            .background(Capsule(style: .continuous).fill(agentStatusColor(for: session).opacity(0.14)))
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(panelUIFont(size: 13, weight: .black))
+                            .foregroundColor(isExpanded ? DS.Colors.accentText : DS.Colors.textTertiary)
+                    }
+                    .padding(.vertical, 10)
+                    .padding(.leading, 10)
+                    .padding(.trailing, showsTerminalControl ? 4 : 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isExpanded ? "Collapse \(session.title)" : "Expand \(session.title)")
+                .help(isExpanded ? "Collapse \(session.title)" : "Expand \(session.title)")
+
+                if canStop {
+                    agentArchiveButton(
+                        systemImageName: "stop.circle.fill",
+                        accessibilityLabel: "Stop running task \(session.title)",
+                        helpText: "Stop this running Odysseus task",
+                        foregroundColor: DS.Colors.destructiveText
+                    ) {
+                        pendingStopAgentSessionID = session.id
+                    }
+                } else if canResume {
+                    agentArchiveButton(
+                        systemImageName: "play.circle.fill",
+                        accessibilityLabel: "Resume task \(session.title)",
+                        helpText: "Resume this unfinished Odysseus task",
+                        foregroundColor: DS.Colors.warning
+                    ) {
+                        resumeAgentSessionAfterRelaunch(session)
+                    }
+                } else if isArchived {
+                    agentArchiveButton(
+                        systemImageName: "tray.and.arrow.up.fill",
+                        accessibilityLabel: "Unarchive \(session.title)",
+                        helpText: "Unarchive this Odysseus task"
+                    ) {
+                        companionManager.unarchiveSession(session.id)
+                    }
+                } else if canArchive {
+                    agentArchiveButton(
+                        systemImageName: "archivebox.fill",
+                        accessibilityLabel: "Archive task \(session.title)",
+                        helpText: "Archive this Odysseus task"
+                    ) {
+                        requestArchiveAgentSession(session)
+                    }
+                }
+            }
+            .padding(.trailing, showsTerminalControl ? 8 : 0)
+
+            if isExpanded {
+                expandedAgentConversation(for: session)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 10)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 15, style: .continuous).fill(Color.white.opacity(isExpanded ? 0.072 : 0.055)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .stroke(session.id == companionManager.activeCodexAgentSessionID ? DS.Colors.accentText.opacity(0.35) : Color.white.opacity(0.06), lineWidth: 1)
+        )
+        .animation(.spring(response: 0.24, dampingFraction: 0.86), value: isExpanded)
+    }
+
+    @MainActor
+    private func agentArchiveButton(
+        systemImageName: String,
+        accessibilityLabel: String,
+        helpText: String,
+        foregroundColor: Color? = nil,
+        action: @escaping () -> Void
+    ) -> some View {
+        let resolvedForegroundColor = foregroundColor ?? DS.Colors.textSecondary
+        return Button(action: action) {
+            Image(systemName: systemImageName)
+                .font(panelUIFont(size: 13, weight: .black))
+                .foregroundColor(resolvedForegroundColor)
+                .frame(width: 30, height: 30)
+                .background(
+                    Circle()
+                        .fill(Color.white.opacity(0.075))
+                )
+                .overlay(
+                    Circle()
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
+        .help(helpText)
+    }
+
+    private func expandedAgentConversation(for session: CodexAgentSession) -> some View {
+        let entries = agentConversationEntries(for: session)
+        let activityLines = agentLiveActivityLines(for: session)
+        let isWorkActive = isAgentWorkVisiblyActive(for: session)
+        return VStack(spacing: 8) {
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: true) {
+                    LazyVStack(alignment: .leading, spacing: 7) {
+                        if entries.isEmpty {
+                            Text("No conversation yet. Send a follow-up to talk to this Odysseus task.")
+                                .font(panelUIFont(size: 10, weight: .semibold))
+                                .foregroundColor(DS.Colors.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(9)
+                                .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(Color.white.opacity(0.045)))
+                        } else {
+                            ForEach(entries) { entry in
+                                compactChatBubble(entry)
+                                    .id(entry.id)
+                            }
+                        }
+
+                        ForEach(Array(activityLines.enumerated()), id: \.offset) { index, line in
+                            let isCurrentLiveLine = isWorkActive
+                                && index == activityLines.count - 1
+                                && !isCompletedAgentActivityLine(line)
+                            agentLiveActivityRow(line, isRunning: isCurrentLiveLine)
+                                .id("\(session.id.uuidString)-agent-live-activity-\(index)")
+                        }
+
+                        if isWorkActive {
+                            agentLiveActivityRow(agentWorkActivityLabel(for: session), isRunning: true)
+                                .id("\(session.id.uuidString)-agent-status")
+                        }
+
+                        if session.canResumeAfterRelaunch {
+                            Button {
+                                resumeAgentSessionAfterRelaunch(session)
+                            } label: {
+                                Label("Resume task", systemImage: "arrow.clockwise.circle.fill")
+                                    .font(panelUIFont(size: 11, weight: .heavy))
+                                    .foregroundColor(DS.Colors.textOnAccent)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 7)
+                                    .background(Capsule(style: .continuous).fill(DS.Colors.accent))
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Resume Odysseus task after relaunch")
+                            .help("Resume this unfinished Odysseus task after relaunch")
+                            .id("\(session.id.uuidString)-resume-task")
+                        }
+                    }
+                    .padding(9)
+                }
+                .frame(minHeight: expandedAgentConversationMinHeight, maxHeight: expandedAgentConversationMaxHeight)
+                .background(RoundedRectangle(cornerRadius: 15, style: .continuous).fill(Color.black.opacity(0.22)))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 15, style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+                .onAppear {
+                    scrollExpandedAgentConversationToBottom(proxy, entries: entries, session: session, animated: false)
+                }
+                .onChange(of: session.entries.count) {
+                    scrollExpandedAgentConversationToBottom(proxy, entries: entries, session: session)
+                    notifyPanelSizeChanged()
+                }
+                .onChange(of: session.isTurnActiveForChatQueue) {
+                    scrollExpandedAgentConversationToBottom(proxy, entries: entries, session: session)
+                    notifyPanelSizeChanged()
+                }
+                .onChange(of: session.progressStage) {
+                    scrollExpandedAgentConversationToBottom(proxy, entries: entries, session: session)
+                    notifyPanelSizeChanged()
+                }
+                .onChange(of: session.activityStatusLines) {
+                    scrollExpandedAgentConversationToBottom(proxy, entries: entries, session: session)
+                    notifyPanelSizeChanged()
+                }
+            }
+
+            agentReplyField(for: session)
+        }
+    }
+
+    private var hasExpandedAgentChatExpansionRoom: Bool {
+        visibleAgentSessions.count <= 2
+    }
+
+    private var expandedAgentConversationMinHeight: CGFloat {
+        hasExpandedAgentChatExpansionRoom ? 220 : 150
+    }
+
+    private var expandedAgentConversationMaxHeight: CGFloat {
+        hasExpandedAgentChatExpansionRoom ? 320 : 220
+    }
+
+    private func agentReplyField(for session: CodexAgentSession) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            if !expandedAgentAttachments.isEmpty {
+                attachmentChipRow(attachments: expandedAgentAttachments, remove: removeExpandedAgentAttachment)
+            }
+
+            OdysseusPromptAutocompletePanel(options: expandedAgentAutocompleteOptions) { option in
+                OdysseusPromptAutocomplete.apply(option, to: &expandedAgentPrompt)
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: "arrowshape.turn.up.left.fill")
+                    .font(panelUIFont(size: 15, weight: .bold))
+                    .foregroundColor(DS.Colors.accentText)
+                TextField(expandedAgentAttachments.isEmpty ? "Talk to this task…" : "Talk to this task about the attachment…", text: $expandedAgentPrompt, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(panelUIFont(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .lineLimit(1...5)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .focused($isExpandedAgentPromptFocused)
+                    .submitLabel(.send)
+                    .onSubmit { submitExpandedAgentPromptFromKeyboard(to: session) }
+                    .onKeyPress(.return, phases: .down) { keyPress in
+                        if keyPress.modifiers.contains(.shift) {
+                            return .ignored
+                        }
+                        submitExpandedAgentPromptFromKeyboard(to: session)
+                        return .handled
+                    }
+                    .onKeyPress(.tab, phases: .down) { _ in
+                        OdysseusPromptAutocomplete.acceptFirstOption(
+                            in: &expandedAgentPrompt,
+                            agents: agentStore.agents,
+                            skillSuggestions: skillDiscoveryStore.suggestions
+                        ) ? .handled : .ignored
+                    }
+                    .onKeyPress("v", phases: .down) { keyPress in
+                        guard keyPress.modifiers.contains(.command) else { return .ignored }
+                        return pasteExpandedAgentAttachmentsFromClipboard() ? .handled : .ignored
+                    }
+                Button {
+                    submitExpandedAgentPrompt(to: session)
+                } label: {
+                    Image(systemName: "paperplane.fill")
+                        .font(panelUIFont(size: 13, weight: .black))
+                        .foregroundColor(DS.Colors.textOnAccent)
+                        .frame(width: 34, height: 30)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(LinearGradient(colors: [DS.Colors.accent, DS.Colors.accentHover], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    )
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.return, modifiers: [])
+                .accessibilityLabel("Send message to Odysseus task")
+                .help("Send message to Odysseus task")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.black.opacity(0.28)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(isExpandedAgentDropTargeted ? DS.Colors.accentText.opacity(0.55) : Color.white.opacity(0.08), lineWidth: isExpandedAgentDropTargeted ? 1.2 : 1)
+        )
+        .overlay {
+            if isExpandedAgentDropTargeted {
+                dropTargetOverlay
+            }
+        }
+        .onDrop(
+            of: Self.supportedAttachmentDropTypes,
+            isTargeted: $isExpandedAgentDropTargeted
+        ) { providers in
+            handleAttachmentDrop(providers) { url, kind in
+                addExpandedAgentAttachment(url, forcedKind: kind)
+            }
+        }
+        .animation(.easeOut(duration: 0.16), value: isExpandedAgentDropTargeted)
+    }
+
+    private func scrollExpandedAgentConversationToBottom(
+        _ proxy: ScrollViewProxy,
+        entries: [CodexTranscriptEntry],
+        session: CodexAgentSession,
+        animated: Bool = true
+    ) {
+        let targetID = isAgentWorkVisiblyActive(for: session)
+            ? "\(session.id.uuidString)-agent-status"
+            : entries.last?.id
+        guard let targetID else { return }
+        let action = { proxy.scrollTo(targetID, anchor: .bottom) }
+        if animated {
+            withAnimation(.easeOut(duration: 0.18), action)
+        } else {
+            action()
+        }
+    }
+
+    private func isAgentWorkVisiblyActive(for session: CodexAgentSession) -> Bool {
+        if session.isTurnActiveForChatQueue { return true }
+
+        switch session.progressStage {
+        case .starting, .planning, .executing, .composing:
+            return true
+        case .idle, .completed, .failed:
+            return false
+        }
+    }
+
+    private func agentWorkActivityLabel(for session: CodexAgentSession) -> String {
+        switch session.progressStage {
+        case .starting:
+            return "Odysseus is thinking…"
+        case .planning:
+            return "Odysseus is planning…"
+        case .executing:
+            return "Odysseus is working…"
+        case .composing:
+            return "Odysseus is writing…"
+        case .idle:
+            return session.isTurnActiveForChatQueue ? "Odysseus is thinking…" : "Odysseus is ready."
+        case .completed:
+            return "Odysseus finished."
+        case .failed:
+            return "Odysseus stopped."
+        }
+    }
+
+    private func agentLiveActivityLines(for session: CodexAgentSession) -> [String] {
+        guard isAgentWorkVisiblyActive(for: session) else { return [] }
+        var seen = Set<String>()
+        let lines = session.activityStatusLines.reversed().compactMap { rawLine -> String? in
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !seen.contains(line) else { return nil }
+            seen.insert(line)
+            return line
+        }
+        return Array(lines.prefix(3)).reversed()
+    }
+
+    private func agentLiveActivityRow(_ line: String, isRunning: Bool) -> some View {
+        HStack(alignment: .center, spacing: 7) {
+            if isRunning {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.62)
+            } else {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(appUIFont(size: max(10, subtextFontSize), weight: .semibold))
+                    .foregroundColor(DS.Colors.success.opacity(0.86))
+                    .frame(width: 14, height: 14)
+            }
+            Text(line)
+                .font(appUIFont(size: max(10, subtextFontSize), weight: .semibold))
+                .foregroundColor(DS.Colors.textSecondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, max(9, bodyFontSize * 0.75))
+        .padding(.vertical, max(7, bodyFontSize * 0.52))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(Color.white.opacity(0.045)))
+        .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).stroke(Color.white.opacity(0.055), lineWidth: 0.5))
+    }
+
+    private func isCompletedAgentActivityLine(_ line: String) -> Bool {
+        let lowered = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return lowered.hasPrefix("command finished")
+            || lowered.hasPrefix("command failed")
+            || lowered.hasPrefix("finished")
+            || lowered.hasPrefix("planned")
+            || lowered.hasPrefix("changed")
+            || lowered.hasPrefix("updated")
+            || lowered.hasPrefix("created")
+            || lowered.hasPrefix("deleted")
+    }
+
+    private func agentConversationEntries(for session: CodexAgentSession) -> [CodexTranscriptEntry] {
+        let visibleEntries = session.entries.compactMap { entry -> CodexTranscriptEntry? in
+            guard entry.role != .command else { return nil }
+            var displayEntry = entry
+            displayEntry.text = compactChatDisplayText(from: entry.text)
+            return displayEntry.text.isEmpty ? nil : displayEntry
+        }
+        return Array(visibleEntries.suffix(hasExpandedAgentChatExpansionRoom ? 14 : 6))
+    }
+
+    private func submitExpandedAgentPromptFromKeyboard(to session: CodexAgentSession) {
+        guard shouldAcceptKeyboardSubmit() else { return }
+        submitExpandedAgentPrompt(to: session)
+    }
+
+    private func shouldAcceptKeyboardSubmit() -> Bool {
+        let now = Date()
+        guard now.timeIntervalSince(lastKeyboardSubmitAt) > 0.18 else { return false }
+        lastKeyboardSubmitAt = now
+        return true
+    }
+
+    private func submitExpandedAgentPrompt(to session: CodexAgentSession) {
+        let trimmedPrompt = expandedAgentPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let attachments = expandedAgentAttachments
+        guard !trimmedPrompt.isEmpty || !attachments.isEmpty else { return }
+
+        expandedAgentPrompt = ""
+        expandedAgentAttachments.removeAll()
+        companionManager.selectCodexAgentSession(session.id)
+        companionManager.submitAgentPromptFromUI(promptWithAttachments(trimmedPrompt, attachments: attachments))
+        notifyPanelSizeChanged()
+    }
+
+    private func connectionRow(_ row: OdysseusNotchConnectionRow) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: row.systemImageName)
+                .font(panelUIFont(size: 15, weight: .heavy))
+                .foregroundColor(row.state.color)
+                .frame(width: 32, height: 32)
+                .background(Circle().fill(row.state.color.opacity(0.14)))
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(row.title)
+                        .font(panelUIFont(size: 12, weight: .heavy))
+                        .foregroundColor(DS.Colors.textPrimary)
+                    Text(row.state.title)
+                        .font(appUIFont(size: max(9, subtextFontSize - 2), weight: .black))
+                        .foregroundColor(row.state.color)
+                        .padding(.horizontal, max(6, subtextFontSize * 0.58))
+                        .padding(.vertical, max(3, subtextFontSize * 0.28))
+                        .background(Capsule(style: .continuous).fill(row.state.color.opacity(0.14)))
+                }
+                Text(row.detail)
+                    .font(panelUIFont(size: 10, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 6)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 15, style: .continuous).fill(Color.white.opacity(0.052)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .stroke(Color.white.opacity(0.065), lineWidth: 1)
+        )
+    }
+
+    private func settingSummaryRow(title: String, detail: String, systemImageName: String) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: systemImageName)
+                .font(panelUIFont(size: 13, weight: .bold))
+                .foregroundColor(DS.Colors.accentText)
+                .frame(width: 28, height: 28)
+                .background(Circle().fill(DS.Colors.accentText.opacity(0.12)))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(panelUIFont(size: 10, weight: .heavy))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text(detail)
+                    .font(panelUIFont(size: 12, weight: .heavy))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 6)
+        }
+        .padding(9)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.white.opacity(0.052)))
+    }
+
+    private func statusPill(title: String, systemImageName: String, color: Color) -> some View {
+        Image(systemName: systemImageName)
+            .font(appUIFont(size: max(14, subtextFontSize + 3), weight: .heavy))
+            .foregroundColor(color)
+            .lineLimit(1)
+            .frame(width: max(30, subtextFontSize * 2.45), height: max(30, subtextFontSize * 2.45))
+            .background(Circle().fill(color.opacity(0.105)))
+            .overlay(Circle().stroke(color.opacity(0.18), lineWidth: 1))
+            .accessibilityLabel(title)
+            .help(title)
+    }
+
+    private func primaryActionButton(title: String, systemImageName: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: systemImageName)
+                    .font(panelUIFont(size: 13, weight: .black))
+                Text(title)
+                    .font(panelUIFont(size: 11, weight: .heavy))
+            }
+            .foregroundColor(DS.Colors.textOnAccent)
+            .lineLimit(1)
+            .minimumScaleFactor(0.82)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(LinearGradient(colors: [DS.Colors.accent, DS.Colors.accentHover], startPoint: .topLeading, endPoint: .bottomTrailing))
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .help(title)
+    }
+
+    private func secondaryActionButton(title: String, systemImageName: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: systemImageName)
+                    .font(panelUIFont(size: 13, weight: .black))
+                Text(title)
+                    .font(panelUIFont(size: 11, weight: .heavy))
+            }
+            .foregroundColor(DS.Colors.textPrimary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.82)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.white.opacity(0.07)))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .help(title)
+    }
+
+    private func submitQuickAskPrompt() {
+        let trimmedPrompt = quickPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let attachments = quickPromptAttachments
+        // Empty submit does nothing -- previously this fell back to the legacy
+        // expandTextInput dialog ("Ask Odysseus / Voice / Text / Agent"),
+        // which is being retired in favor of this in-panel prompt surface.
+        guard !trimmedPrompt.isEmpty || !attachments.isEmpty else { return }
+
+        quickPrompt = ""
+        quickPromptAttachments.removeAll()
+        quickPromptDroppedPathFragments.removeAll()
+        if attachments.isEmpty {
+            companionManager.submitTextPrompt(trimmedPrompt)
+        } else {
+            companionManager.submitNewAgentTaskFromUI(
+                promptWithAttachments(trimmedPrompt, attachments: attachments),
+                source: "open_odysseus_panel_ask"
+            )
+            selectedTab = .agents
+        }
+        notifyPanelSizeChanged()
+    }
+
+    private func submitQuickPromptFromKeyboard() {
+        guard shouldAcceptKeyboardSubmit() else { return }
+        submitQuickPrompt()
+    }
+
+    private func submitQuickPrompt() {
+        switch quickPromptMode {
+        case .ask:
+            submitQuickAskPrompt()
+        case .agent:
+            submitQuickAgentPrompt()
+        case .chat:
+            submitQuickChatPrompt()
+        }
+    }
+
+    private func submitQuickChatPrompt() {
+        let trimmedPrompt = quickPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let attachments = quickPromptAttachments
+        guard !trimmedPrompt.isEmpty || !attachments.isEmpty else {
+            notifyPanelSizeChanged()
+            return
+        }
+
+        quickPrompt = ""
+        quickPromptAttachments.removeAll()
+        quickPromptDroppedPathFragments.removeAll()
+        withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+            isCompactChatExpanded = true
+        }
+        companionManager.submitHomeChatPromptFromUI(
+            promptWithAttachments(trimmedPrompt, attachments: attachments),
+            source: "open_odysseus_panel_chat"
+        )
+        notifyPanelSizeChanged()
+    }
+
+    private func submitQuickAgentPrompt() {
+        let trimmedPrompt = quickPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let attachments = quickPromptAttachments
+        guard !trimmedPrompt.isEmpty || !attachments.isEmpty else {
+            selectedTab = .agents
+            notifyPanelSizeChanged()
+            return
+        }
+
+        quickPrompt = ""
+        quickPromptAttachments.removeAll()
+        quickPromptDroppedPathFragments.removeAll()
+        companionManager.submitNewAgentTaskFromUI(
+            promptWithAttachments(trimmedPrompt, attachments: attachments),
+            source: "open_odysseus_panel_agent"
+        )
+        selectedTab = .agents
+        notifyPanelSizeChanged()
+    }
+
+    private var dropTargetOverlay: some View {
+        RoundedRectangle(cornerRadius: 15, style: .continuous)
+            .fill(Color.black.opacity(0.34))
+            .overlay(
+                RoundedRectangle(cornerRadius: 15, style: .continuous)
+                    .stroke(DS.Colors.accentText.opacity(0.52), style: StrokeStyle(lineWidth: 1.1, dash: [6, 5]))
+            )
+            .overlay(
+                HStack(spacing: 8) {
+                    Image(systemName: "plus.rectangle.on.folder")
+                        .font(panelUIFont(size: 15, weight: .heavy))
+                        .foregroundColor(DS.Colors.accentText)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Drop images or docs")
+                            .font(panelUIFont(size: 11, weight: .heavy))
+                            .foregroundColor(DS.Colors.textPrimary)
+                        Text("Odysseus will attach them before sending")
+                            .font(panelUIFont(size: 9, weight: .semibold))
+                            .foregroundColor(DS.Colors.textSecondary)
+                    }
+                }
+                .padding(.horizontal, 12)
+            )
+    }
+
+    private func attachmentChipRow(attachments: [PanelDraftAttachment], remove: @escaping (PanelDraftAttachment) -> Void) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 7) {
+                ForEach(attachments) { attachment in
+                    HStack(spacing: 7) {
+                        Image(systemName: attachment.systemImage)
+                            .font(appUIFont(size: max(10, subtextFontSize), weight: .heavy))
+                            .foregroundColor(attachment.kind == .image ? DS.Colors.accentText : DS.Colors.textSecondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(attachment.chipTitle)
+                                .font(appUIFont(size: max(10, subtextFontSize), weight: .heavy))
+                                .foregroundColor(DS.Colors.textPrimary)
+                                .lineLimit(1)
+                            Text(attachment.displayName)
+                                .font(appUIFont(size: max(8, subtextFontSize - 3), weight: .semibold))
+                                .foregroundColor(DS.Colors.textTertiary)
+                                .lineLimit(1)
+                        }
+                        Button(action: { remove(attachment) }) {
+                            Image(systemName: "xmark")
+                                .font(panelUIFont(size: 8, weight: .heavy))
+                                .foregroundColor(DS.Colors.textTertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Remove attachment")
+                        .help("Remove attachment")
+                    }
+                    .padding(.leading, max(8, subtextFontSize * 0.72))
+                    .padding(.trailing, max(7, subtextFontSize * 0.64))
+                    .padding(.vertical, max(6, subtextFontSize * 0.50))
+                    .background(Capsule(style: .continuous).fill(Color.white.opacity(0.085)))
+                    .overlay(Capsule(style: .continuous).stroke(Color.white.opacity(0.13), lineWidth: 0.6))
+                }
+            }
+        }
+    }
+
+    private func pasteQuickPromptAttachmentsFromClipboard() -> Bool {
+        handleAttachmentPasteboard(NSPasteboard.general) { url, kind in
+            addQuickPromptAttachment(url, forcedKind: kind)
+        }
+    }
+
+    private func pasteExpandedAgentAttachmentsFromClipboard() -> Bool {
+        handleAttachmentPasteboard(NSPasteboard.general) { url, kind in
+            addExpandedAgentAttachment(url, forcedKind: kind)
+        }
+    }
+
+    private func handleAttachmentPasteboard(
+        _ pasteboard: NSPasteboard,
+        addAttachment: @escaping @MainActor (URL, PanelDraftAttachment.AttachmentKind?) -> Void
+    ) -> Bool {
+        let attachments = Self.attachmentURLs(from: pasteboard)
+        guard !attachments.isEmpty else { return false }
+
+        for attachment in attachments {
+            addAttachment(attachment.url, attachment.kind)
+        }
+        notifyPanelSizeChanged()
+        return true
+    }
+
+    private func handlePanelAttachmentDrop(_ providers: [NSItemProvider]) -> Bool {
+        if selectedTab == .agents, expandedAgentSessionID != nil {
+            return handleAttachmentDrop(providers) { url, kind in
+                addExpandedAgentAttachment(url, forcedKind: kind)
+            }
+        }
+
+        if selectedTab != .home {
+            selectedTab = .home
+        }
+
+        return handleAttachmentDrop(providers) { url, kind in
+            addQuickPromptAttachment(url, forcedKind: kind)
+        }
+    }
+
+    private func handleAttachmentDrop(
+        _ providers: [NSItemProvider],
+        addAttachment: @escaping @MainActor (URL, PanelDraftAttachment.AttachmentKind?) -> Void
+    ) -> Bool {
+        var acceptedDrop = false
+
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                acceptedDrop = true
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    guard let url = Self.fileURL(from: item) else { return }
+                    Task { @MainActor in
+                        addAttachment(url, nil)
+                    }
+                }
+                continue
+            }
+
+            if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                acceptedDrop = true
+                provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                    guard let data, let url = Self.persistDroppedImage(data) else { return }
+                    Task { @MainActor in
+                        addAttachment(url, .image)
+                    }
+                }
+            }
+        }
+
+        return acceptedDrop
+    }
+
+    private func addQuickPromptAttachment(_ url: URL, forcedKind: PanelDraftAttachment.AttachmentKind? = nil) {
+        let standardizedURL = url.standardizedFileURL
+        rememberQuickPromptDroppedPath(standardizedURL)
+        if quickPromptAttachments.contains(where: { $0.url.standardizedFileURL == standardizedURL }) == false {
+            let kind = forcedKind ?? Self.attachmentKind(for: standardizedURL)
+            quickPromptAttachments.append(PanelDraftAttachment(url: standardizedURL, kind: kind))
+        }
+        scrubDroppedPathsFromQuickPrompt()
+    }
+
+    private func addExpandedAgentAttachment(_ url: URL, forcedKind: PanelDraftAttachment.AttachmentKind? = nil) {
+        let standardizedURL = url.standardizedFileURL
+        guard expandedAgentAttachments.contains(where: { $0.url.standardizedFileURL == standardizedURL }) == false else { return }
+        let kind = forcedKind ?? Self.attachmentKind(for: standardizedURL)
+        expandedAgentAttachments.append(PanelDraftAttachment(url: standardizedURL, kind: kind))
+    }
+
+    private func removeQuickPromptAttachment(_ attachment: PanelDraftAttachment) {
+        quickPromptAttachments.removeAll { $0.id == attachment.id }
+        quickPromptDroppedPathFragments = Set(quickPromptAttachments.flatMap { Self.promptPathFragments(for: $0.url) })
+    }
+
+    private func rememberQuickPromptDroppedPath(_ url: URL) {
+        for fragment in Self.promptPathFragments(for: url) {
+            quickPromptDroppedPathFragments.insert(fragment)
+        }
+
+        // SwiftUI's text field may accept a file drop as text after our drop
+        // handler has already made the proper attachment chip. Scrub once now
+        // and again on the next main-actor turn so a dragged file never lands
+        // in the Home composer as a raw path.
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            scrubDroppedPathsFromQuickPrompt()
+        }
+    }
+
+    private func scrubDroppedPathsFromQuickPrompt() {
+        guard !quickPrompt.isEmpty, !quickPromptDroppedPathFragments.isEmpty else { return }
+
+        var scrubbedPrompt = quickPrompt
+        for fragment in quickPromptDroppedPathFragments where !fragment.isEmpty {
+            scrubbedPrompt = scrubbedPrompt.replacingOccurrences(of: fragment, with: "")
+        }
+
+        let normalizedPrompt = Self.normalizedPromptAfterDroppingPathText(scrubbedPrompt)
+        if normalizedPrompt != quickPrompt {
+            quickPrompt = normalizedPrompt
+        }
+    }
+
+    private func removeExpandedAgentAttachment(_ attachment: PanelDraftAttachment) {
+        expandedAgentAttachments.removeAll { $0.id == attachment.id }
+    }
+
+    private func promptWithAttachments(_ prompt: String, attachments: [PanelDraftAttachment]) -> String {
+        guard !attachments.isEmpty else { return prompt }
+
+        let request = prompt.isEmpty ? "Please review the attached file(s)." : prompt
+        let attachmentLines = attachments.enumerated().map { index, attachment in
+            "\(index + 1). \(attachment.kindLabel): \(attachment.url.path)"
+        }.joined(separator: "\n")
+
+        return """
+        \(request)
+
+        Odysseus panel attachments:
+        These attachments are task context/reference material. Use them to understand and complete the request; do not treat them as files the user is asking you to find or show back unless the request explicitly says so.
+        \(attachmentLines)
+        """.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    nonisolated private static func attachmentURLs(from pasteboard: NSPasteboard) -> [(url: URL, kind: PanelDraftAttachment.AttachmentKind?)] {
+        var attachments: [(url: URL, kind: PanelDraftAttachment.AttachmentKind?)] = []
+        var seen = Set<String>()
+
+        func appendURL(_ url: URL, kind: PanelDraftAttachment.AttachmentKind? = nil) {
+            let standardized = url.standardizedFileURL
+            let key = standardized.path
+            guard !seen.contains(key) else { return }
+            seen.insert(key)
+            attachments.append((standardized, kind))
+        }
+
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+            for url in urls where url.isFileURL {
+                appendURL(url)
+            }
+        }
+
+        for item in pasteboard.pasteboardItems ?? [] {
+            if let fileURLString = item.string(forType: .fileURL),
+               let url = URL(string: fileURLString),
+               url.isFileURL {
+                appendURL(url)
+            }
+
+            if let pathString = item.string(forType: .string), let url = fileURLFromClipboardString(pathString) {
+                appendURL(url)
+            }
+
+            if let data = item.data(forType: .png) ?? item.data(forType: .tiff),
+               let url = persistDroppedImage(data) {
+                appendURL(url, kind: .image)
+            }
+        }
+
+        return attachments
+    }
+
+    nonisolated private static func fileURLFromClipboardString(_ string: String) -> URL? {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.contains("\n") == false else { return nil }
+
+        if let url = URL(string: trimmed), url.isFileURL {
+            return url.standardizedFileURL
+        }
+
+        let expandedPath: String
+        if trimmed.hasPrefix("~/") {
+            expandedPath = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(String(trimmed.dropFirst(2)))
+                .path
+        } else {
+            expandedPath = trimmed
+        }
+
+        var isDirectory: ObjCBool = false
+        guard expandedPath.hasPrefix("/"), FileManager.default.fileExists(atPath: expandedPath, isDirectory: &isDirectory) else {
+            return nil
+        }
+        return URL(fileURLWithPath: expandedPath, isDirectory: isDirectory.boolValue).standardizedFileURL
+    }
+
+    private static var supportedAttachmentDropTypes: [String] {
+        [
+            UTType.fileURL.identifier,
+            UTType.image.identifier,
+            UTType.png.identifier,
+            UTType.jpeg.identifier,
+            UTType.pdf.identifier
+        ]
+    }
+
+    nonisolated private static func fileURL(from item: Any?) -> URL? {
+        if let url = item as? URL {
+            return url.isFileURL ? url.standardizedFileURL : nil
+        }
+        if let data = item as? Data {
+            return URL(dataRepresentation: data, relativeTo: nil)?.standardizedFileURL
+        }
+        if let data = item as? NSData {
+            return URL(dataRepresentation: data as Data, relativeTo: nil)?.standardizedFileURL
+        }
+        if let string = item as? String {
+            return URL(string: string)?.standardizedFileURL
+        }
+        return nil
+    }
+
+    nonisolated private static func promptPathFragments(for url: URL) -> Set<String> {
+        let standardizedURL = url.standardizedFileURL
+        var fragments: Set<String> = [
+            standardizedURL.path,
+            standardizedURL.absoluteString
+        ]
+
+        if let decodedPath = standardizedURL.path.removingPercentEncoding {
+            fragments.insert(decodedPath)
+        }
+        if let decodedAbsoluteString = standardizedURL.absoluteString.removingPercentEncoding {
+            fragments.insert(decodedAbsoluteString)
+        }
+
+        return fragments.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    nonisolated private static func normalizedPromptAfterDroppingPathText(_ prompt: String) -> String {
+        prompt
+            .components(separatedBy: .newlines)
+            .map { line in
+                line
+                    .replacingOccurrences(of: "  ", with: " ")
+                    .trimmingCharacters(in: .whitespaces)
+            }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func attachmentKind(for url: URL) -> PanelDraftAttachment.AttachmentKind {
+        if let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType,
+           type.conforms(to: .image) {
+            return .image
+        }
+
+        let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "heic", "webp", "tiff", "bmp"]
+        if imageExtensions.contains(url.pathExtension.lowercased()) {
+            return .image
+        }
+
+        return .document
+    }
+
+    nonisolated private static func pngImageData(from data: Data) -> Data? {
+        guard let image = NSImage(data: data),
+              let tiffData = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData) else {
+            return nil
+        }
+        return bitmap.representation(using: .png, properties: [:])
+    }
+
+    nonisolated private static func persistDroppedImage(_ data: Data) -> URL? {
+        let directory = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Odysseus/AgentMode/DroppedAttachments", isDirectory: true)
+
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent("panel-image-\(UUID().uuidString).png", isDirectory: false)
+            let pngData = pngImageData(from: data) ?? data
+            try pngData.write(to: url, options: .atomic)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    private func refreshGogStatus() async {
+        gogStatus = await OdysseusGogCLIStatusResolver.refresh()
+        hasLoadedGogStatus = true
+    }
+
+    private func notifyPanelSizeChanged() {
+        NotificationCenter.default.post(
+            name: .odysseusPanelContentSizeDidChange,
+            object: nil,
+            userInfo: ["preferredPanelHeight": preferredPanelHeightForSelectedTab]
+        )
+    }
+
+    private func focusQuickPromptIfHome() {
+        guard selectedTab == .home else { return }
+        DispatchQueue.main.async {
+            isQuickPromptFocused = true
+        }
+    }
+
+    private func focusExpandedAgentPromptIfNeeded() {
+        guard selectedTab == .agents, expandedAgentSessionID != nil else { return }
+        DispatchQueue.main.async {
+            isExpandedAgentPromptFocused = true
+        }
+    }
+
+    private func agentStatusLabel(for session: CodexAgentSession) -> String {
+        session.canResumeAfterRelaunch ? "Resume" : session.status.label
+    }
+
+    private func agentStatusColor(for session: CodexAgentSession) -> Color {
+        if session.canResumeAfterRelaunch {
+            return .orange
+        }
+        return agentStatusColor(session.status)
+    }
+
+    private func agentStatusColor(_ status: CodexAgentSessionStatus) -> Color {
+        switch status {
+        case .stopped:
+            return DS.Colors.textTertiary
+        case .starting:
+            return .orange
+        case .ready:
+            return .green
+        case .running:
+            return DS.Colors.accentText
+        case .failed:
+            return DS.Colors.destructive
+        }
+    }
+}

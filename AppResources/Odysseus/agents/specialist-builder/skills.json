@@ -1,0 +1,11 @@
+{
+  "enabledSkillIDs": [
+    "odysseus-specialist-agents",
+    "skill-creator",
+    "skill-installer",
+    "find-skills",
+    "codex",
+    "odysseus-repo-operator",
+    "optimize-odysseus-skills"
+  ]
+}

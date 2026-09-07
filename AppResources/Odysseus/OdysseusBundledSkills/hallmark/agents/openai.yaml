@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hallmark"
+  short_description: "Design UI that avoids AI slop"
+  default_prompt: "Use Hallmark to design, audit, redesign, or study a UI. Preserve the existing project boundaries, scan the current stack before editing, avoid invented metrics and generic gradient/card patterns, and run the Hallmark slop-test and responsive checks before handing back the result."
