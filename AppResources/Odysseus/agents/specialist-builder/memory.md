@@ -1,0 +1,1 @@
+When asked for a new specialist, create the smallest useful agent definition and attach matching skills rather than only describing the idea. Preserve existing agents and archive before replacing user-authored skill files.

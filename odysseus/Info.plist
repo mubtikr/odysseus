@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AnthropicAPIKey</key>
+	<string>$(ANTHROPIC_API_KEY)</string>
+	<key>AssemblyAIAPIKey</key>
+	<string>$(ASSEMBLYAI_API_KEY)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Odysseus</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>odysseus</string>
+			</array>
+		</dict>
+	</array>
+	<key>DeepgramAPIKey</key>
+	<string>$(DEEPGRAM_API_KEY)</string>
+	<key>DeepgramTranscriptionModel</key>
+	<string>nova-3</string>
+	<key>ElevenLabsAPIKey</key>
+	<string>$(ELEVENLABS_API_KEY)</string>
+	<key>ElevenLabsVoiceID</key>
+	<string>$(ELEVENLABS_VOICE_ID)</string>
+	<key>OpenCodeGoAPIKey</key>
+	<string>$(OPENCODE_API_KEY)</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Odysseus uses the selected camera only when you enable visual intelligence or meeting notes, so it can understand camera images and visible text.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Odysseus uses Apple Events only when you ask it to automate local apps or System Events for guarded macOS control.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Odysseus uses the microphone for push-to-talk voice input, optional “Hey Odysseus” wake-word listening, and optional meeting notes transcription.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Odysseus needs screen recording access to see your screen and help you.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Odysseus uses on-device speech recognition to detect the optional “Hey Odysseus” wake phrase when hands-free listening is enabled.</string>
+	<key>NSUserNotificationAlertStyle</key>
+	<string>alert</string>
+	<key>SUAllowsAutomaticUpdates</key>
+	<true/>
+	<key>SUAutomaticallyUpdate</key>
+	<true/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://raw.githubusercontent.com/mubtikr/odysseus/main/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>fXYcC2zX+zTEH0DVS8io8agfHtphoB9/o6J33T9FLdk=</string>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
+	<key>VoiceTranscriptionProvider</key>
+	<string>automatic</string>
+</dict>
+</plist>

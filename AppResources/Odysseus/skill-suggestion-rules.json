@@ -1,0 +1,414 @@
+{
+  "defaultSuggestions": [
+    {
+      "id": "odysseus-source-change",
+      "title": "Odysseus source-change workflow",
+      "detail": "Default installed workflow for focused Odysseus repo edits, dirty-worktree safety, narrow patches, and lightweight verification.",
+      "source": "installed",
+      "installPrompt": "Use the installed odysseus-source-change skill for the next Odysseus repo patch.",
+      "chipTitle": "Patch repo",
+      "systemImage": "hammer.fill"
+    },
+    {
+      "id": "odysseus-overlay-ui",
+      "title": "Odysseus overlay UI workflow",
+      "detail": "Default installed workflow for HUD, panel, notch, caption, parked-agent, resizing, and Connect-tab UI issues.",
+      "source": "installed",
+      "installPrompt": "Use the installed odysseus-overlay-ui skill to audit and fix the next Odysseus panel or HUD layout issue.",
+      "chipTitle": "Fix UI",
+      "systemImage": "rectangle.inset.filled"
+    },
+    {
+      "id": "odysseus-voice-routing",
+      "title": "Odysseus voice routing workflow",
+      "detail": "Default installed workflow for Realtime, transcription, task-title speech, completion summaries, and spoken-status behavior.",
+      "source": "installed",
+      "installPrompt": "Use the installed odysseus-voice-routing skill to debug the next voice or Realtime routing issue.",
+      "chipTitle": "Debug voice",
+      "systemImage": "waveform"
+    },
+    {
+      "id": "odysseus-log-learning",
+      "title": "Odysseus log-learning workflow",
+      "detail": "Default maintenance workflow for bounded log review, durable learnings, review notes, and archive-first updates.",
+      "source": "installed",
+      "installPrompt": "Run Odysseus's bounded conversation-log learning pass and make only evidence-backed durable updates.",
+      "chipTitle": "Review logs",
+      "systemImage": "doc.text.magnifyingglass"
+    },
+    {
+      "id": "github-pr-workflow",
+      "title": "GitHub PR workflow",
+      "detail": "Default connector-style workflow for repository, issue, PR, and branch checks when Odysseus has GitHub access.",
+      "source": "mcp",
+      "installPrompt": "Use Odysseus's GitHub workflow to inspect the active repository or PR and summarize what needs action.",
+      "chipTitle": "GitHub check",
+      "systemImage": "point.3.connected.trianglepath.dotted"
+    }
+  ],
+  "appRules": [
+    {
+      "id": "lm-studio",
+      "appMatches": [
+        "lm studio",
+        "lmstudio",
+        "ai.elementlabs.lmstudio"
+      ],
+      "suggestions": [
+        {
+          "id": "active-lm-studio-local-models",
+          "title": "Inspect LM Studio models",
+          "detail": "Odysseus can use the active LM Studio window plus local context to summarize loaded models, server state, and next setup steps.",
+          "source": "app",
+          "installPrompt": "Use Odysseus's screen context for LM Studio to inspect the visible loaded model or server state, then suggest the next local-model action.",
+          "chipTitle": "Inspect models",
+          "systemImage": "brain.head.profile"
+        },
+        {
+          "id": "active-lm-studio-api-test",
+          "title": "Test local model API",
+          "detail": "Odysseus can help verify LM Studio's local OpenAI-compatible endpoint and produce the exact command or app setting to use.",
+          "source": "app",
+          "installPrompt": "Check the active LM Studio setup and help verify its local OpenAI-compatible API endpoint without changing credentials or starting destructive commands.",
+          "chipTitle": "Test API",
+          "systemImage": "network"
+        }
+      ]
+    },
+    {
+      "id": "browser",
+      "appMatches": [
+        "chrome",
+        "safari",
+        "firefox",
+        "arc",
+        "edge",
+        "browser"
+      ],
+      "suggestions": [
+        {
+          "id": "active-browser-page-brief",
+          "title": "Summarize current page",
+          "detail": "Odysseus can use browser automation or screen context to summarize the active page, extract links, and turn it into an Agent task.",
+          "source": "app",
+          "installPrompt": "Summarize the current browser page with Odysseus's browser/screen context, then list the important links and recommended next action.",
+          "chipTitle": "Summarise page",
+          "systemImage": "doc.text.magnifyingglass"
+        },
+        {
+          "id": "active-browser-web-research",
+          "title": "Research from this page",
+          "detail": "Starts from the active page and uses live web search when the answer needs current sources.",
+          "source": "app",
+          "installPrompt": "Use the active browser page as context, then do current web research and cite the sources Odysseus relies on.",
+          "chipTitle": "Research page",
+          "systemImage": "globe"
+        }
+      ]
+    },
+    {
+      "id": "active-figma-app-skill",
+      "appMatches": [
+        "figma",
+        "com.figma.desktop"
+      ],
+      "suggestions": [
+        {
+          "id": "active-figma-guided-tour",
+          "title": "Figma guided tour",
+          "detail": "Odysseus can use the imported Figma app context for Auto Layout, components, variants, and Inspect/Design panel guidance.",
+          "source": "app",
+          "installPrompt": "Use Odysseus's screen context and app skill context to give me a concise guided tour of the active Figma window, pointing at visible UI when useful.",
+          "chipTitle": "Tour Figma",
+          "systemImage": "rectangle.3.group.fill"
+        },
+        {
+          "id": "active-figma-workflow-help",
+          "title": "Figma workflow help",
+          "detail": "Ask Odysseus for app-aware next-step help using the Figma concepts and workflows imported from the old fork.",
+          "source": "app",
+          "installPrompt": "Use the active Figma window plus Odysseus's app skill context to suggest the best next workflow step and explain the relevant concept briefly.",
+          "chipTitle": "Figma help",
+          "systemImage": "sparkles"
+        }
+      ]
+    },
+    {
+      "id": "active-blender-app-skill",
+      "appMatches": [
+        "blender",
+        "org.blender.blender"
+      ],
+      "suggestions": [
+        {
+          "id": "active-blender-guided-tour",
+          "title": "Blender guided tour",
+          "detail": "Odysseus can use the imported Blender app context for viewport modes, modifier stack, shader nodes, and mesh-editing workflows.",
+          "source": "app",
+          "installPrompt": "Use Odysseus's screen context and app skill context to give me a concise guided tour of the active Blender window, pointing at visible UI when useful.",
+          "chipTitle": "Tour Blender",
+          "systemImage": "cube.transparent"
+        },
+        {
+          "id": "active-blender-workflow-help",
+          "title": "Blender workflow help",
+          "detail": "Ask Odysseus for app-aware next-step help using the Blender concepts and workflows imported from the old fork.",
+          "source": "app",
+          "installPrompt": "Use the active Blender window plus Odysseus's app skill context to suggest the best next workflow step and explain the relevant concept briefly.",
+          "chipTitle": "Blender help",
+          "systemImage": "sparkles"
+        }
+      ]
+    },
+    {
+      "id": "active-vscode-app-skill",
+      "appMatches": [
+        "visual studio code",
+        "vscode",
+        "com.microsoft.vscode"
+      ],
+      "suggestions": [
+        {
+          "id": "active-vscode-guided-tour",
+          "title": "VS Code guided tour",
+          "detail": "Odysseus can use the imported VS Code app context for Command Palette, multi-cursor editing, terminal, debugging, and Problems panel guidance.",
+          "source": "app",
+          "installPrompt": "Use Odysseus's screen context and app skill context to give me a concise guided tour of the active VS Code window, pointing at visible UI when useful.",
+          "chipTitle": "Tour VS Code",
+          "systemImage": "chevron.left.forwardslash.chevron.right"
+        },
+        {
+          "id": "active-vscode-workflow-help",
+          "title": "VS Code workflow help",
+          "detail": "Ask Odysseus for app-aware next-step help using the VS Code concepts and workflows imported from the old fork.",
+          "source": "app",
+          "installPrompt": "Use the active VS Code window plus Odysseus's app skill context to suggest the best next workflow step and explain the relevant concept briefly.",
+          "chipTitle": "VS Code help",
+          "systemImage": "sparkles"
+        }
+      ]
+    },
+    {
+      "id": "active-excel-app-skill",
+      "appMatches": [
+        "excel",
+        "com.microsoft.excel"
+      ],
+      "suggestions": [
+        {
+          "id": "active-excel-guided-tour",
+          "title": "Microsoft Excel guided tour",
+          "detail": "Odysseus can use the imported Microsoft Excel app context for formulas, references, pivots, validation, charts, and spreadsheet analysis.",
+          "source": "app",
+          "installPrompt": "Use Odysseus's screen context and app skill context to give me a concise guided tour of the active Microsoft Excel window, pointing at visible UI when useful.",
+          "chipTitle": "Tour Microsoft Excel",
+          "systemImage": "tablecells.fill"
+        },
+        {
+          "id": "active-excel-workflow-help",
+          "title": "Microsoft Excel workflow help",
+          "detail": "Ask Odysseus for app-aware next-step help using the Microsoft Excel concepts and workflows imported from the old fork.",
+          "source": "app",
+          "installPrompt": "Use the active Microsoft Excel window plus Odysseus's app skill context to suggest the best next workflow step and explain the relevant concept briefly.",
+          "chipTitle": "Microsoft Excel help",
+          "systemImage": "sparkles"
+        }
+      ]
+    },
+    {
+      "id": "active-final-cut-app-skill",
+      "appMatches": [
+        "final cut",
+        "final cut pro",
+        "com.apple.finalcut"
+      ],
+      "suggestions": [
+        {
+          "id": "active-final-cut-guided-tour",
+          "title": "Final Cut Pro guided tour",
+          "detail": "Odysseus can use the imported Final Cut Pro app context for magnetic timeline, Browser, Inspector, retiming, transitions, and color correction.",
+          "source": "app",
+          "installPrompt": "Use Odysseus's screen context and app skill context to give me a concise guided tour of the active Final Cut Pro window, pointing at visible UI when useful.",
+          "chipTitle": "Tour Final Cut Pro",
+          "systemImage": "film.fill"
+        },
+        {
+          "id": "active-final-cut-workflow-help",
+          "title": "Final Cut Pro workflow help",
+          "detail": "Ask Odysseus for app-aware next-step help using the Final Cut Pro concepts and workflows imported from the old fork.",
+          "source": "app",
+          "installPrompt": "Use the active Final Cut Pro window plus Odysseus's app skill context to suggest the best next workflow step and explain the relevant concept briefly.",
+          "chipTitle": "Final Cut Pro help",
+          "systemImage": "sparkles"
+        }
+      ]
+    },
+    {
+      "id": "active-notion-app-skill",
+      "appMatches": [
+        "notion",
+        "notion.id"
+      ],
+      "suggestions": [
+        {
+          "id": "active-notion-guided-tour",
+          "title": "Notion guided tour",
+          "detail": "Odysseus can use the imported Notion app context for blocks, pages, databases, linked views, templates, and slash-command workflows.",
+          "source": "app",
+          "installPrompt": "Use Odysseus's screen context and app skill context to give me a concise guided tour of the active Notion window, pointing at visible UI when useful.",
+          "chipTitle": "Tour Notion",
+          "systemImage": "square.stack.3d.up.fill"
+        },
+        {
+          "id": "active-notion-workflow-help",
+          "title": "Notion workflow help",
+          "detail": "Ask Odysseus for app-aware next-step help using the Notion concepts and workflows imported from the old fork.",
+          "source": "app",
+          "installPrompt": "Use the active Notion window plus Odysseus's app skill context to suggest the best next workflow step and explain the relevant concept briefly.",
+          "chipTitle": "Notion help",
+          "systemImage": "sparkles"
+        }
+      ]
+    },
+    {
+      "id": "active-xcode-app-skill",
+      "appMatches": [
+        "xcode",
+        "com.apple.dt.xcode"
+      ],
+      "suggestions": [
+        {
+          "id": "active-xcode-guided-tour",
+          "title": "Xcode guided tour",
+          "detail": "Odysseus can use the imported Xcode app context for Navigator, Issues, SwiftUI previews, source control, build/run, and debugging.",
+          "source": "app",
+          "installPrompt": "Use Odysseus's screen context and app skill context to give me a concise guided tour of the active Xcode window, pointing at visible UI when useful.",
+          "chipTitle": "Tour Xcode",
+          "systemImage": "hammer.fill"
+        },
+        {
+          "id": "active-xcode-workflow-help",
+          "title": "Xcode workflow help",
+          "detail": "Ask Odysseus for app-aware next-step help using the Xcode concepts and workflows imported from the old fork.",
+          "source": "app",
+          "installPrompt": "Use the active Xcode window plus Odysseus's app skill context to suggest the best next workflow step and explain the relevant concept briefly.",
+          "chipTitle": "Xcode help",
+          "systemImage": "sparkles"
+        }
+      ]
+    },
+    {
+      "id": "active-terminal-app-skill",
+      "appMatches": [
+        "terminal",
+        "com.apple.terminal"
+      ],
+      "suggestions": [
+        {
+          "id": "active-terminal-guided-tour",
+          "title": "Terminal guided tour",
+          "detail": "Odysseus can use the imported Terminal app context for shell navigation, pipes, redirects, permissions, processes, and Homebrew.",
+          "source": "app",
+          "installPrompt": "Use Odysseus's screen context and app skill context to give me a concise guided tour of the active Terminal window, pointing at visible UI when useful.",
+          "chipTitle": "Tour Terminal",
+          "systemImage": "terminal.fill"
+        },
+        {
+          "id": "active-terminal-workflow-help",
+          "title": "Terminal workflow help",
+          "detail": "Ask Odysseus for app-aware next-step help using the Terminal concepts and workflows imported from the old fork.",
+          "source": "app",
+          "installPrompt": "Use the active Terminal window plus Odysseus's app skill context to suggest the best next workflow step and explain the relevant concept briefly.",
+          "chipTitle": "Terminal help",
+          "systemImage": "sparkles"
+        }
+      ]
+    },
+    {
+      "id": "active-shopify-app-skill",
+      "appMatches": [
+        "shopify",
+        "com.shopify.shopify"
+      ],
+      "suggestions": [
+        {
+          "id": "active-shopify-guided-tour",
+          "title": "Shopify guided tour",
+          "detail": "Odysseus can use the imported Shopify app context for products, collections, orders, themes, analytics, apps, and store settings.",
+          "source": "app",
+          "installPrompt": "Use Odysseus's screen context and app skill context to give me a concise guided tour of the active Shopify window, pointing at visible UI when useful.",
+          "chipTitle": "Tour Shopify",
+          "systemImage": "cart.fill"
+        },
+        {
+          "id": "active-shopify-workflow-help",
+          "title": "Shopify workflow help",
+          "detail": "Ask Odysseus for app-aware next-step help using the Shopify concepts and workflows imported from the old fork.",
+          "source": "app",
+          "installPrompt": "Use the active Shopify window plus Odysseus's app skill context to suggest the best next workflow step and explain the relevant concept briefly.",
+          "chipTitle": "Shopify help",
+          "systemImage": "sparkles"
+        }
+      ]
+    },
+    {
+      "id": "active-premiere-pro-app-skill",
+      "appMatches": [
+        "premiere",
+        "premiere pro",
+        "com.adobe.adobepremierepro"
+      ],
+      "suggestions": [
+        {
+          "id": "active-premiere-pro-guided-tour",
+          "title": "Adobe Premiere Pro guided tour",
+          "detail": "Odysseus can use the imported Adobe Premiere Pro app context for Source/Program monitors, timelines, Effect Controls, Lumetri Color, graphics, and export.",
+          "source": "app",
+          "installPrompt": "Use Odysseus's screen context and app skill context to give me a concise guided tour of the active Adobe Premiere Pro window, pointing at visible UI when useful.",
+          "chipTitle": "Tour Adobe Premiere Pro",
+          "systemImage": "video.fill"
+        },
+        {
+          "id": "active-premiere-pro-workflow-help",
+          "title": "Adobe Premiere Pro workflow help",
+          "detail": "Ask Odysseus for app-aware next-step help using the Adobe Premiere Pro concepts and workflows imported from the old fork.",
+          "source": "app",
+          "installPrompt": "Use the active Adobe Premiere Pro window plus Odysseus's app skill context to suggest the best next workflow step and explain the relevant concept briefly.",
+          "chipTitle": "Adobe Premiere Pro help",
+          "systemImage": "sparkles"
+        }
+      ]
+    },
+    {
+      "id": "developer",
+      "appMatches": [
+        "xcode",
+        "cursor",
+        "code",
+        "terminal",
+        "iterm",
+        "ghostty"
+      ],
+      "suggestions": [
+        {
+          "id": "active-dev-focused-patch",
+          "title": "Focused code patch",
+          "detail": "Odysseus can turn the active developer app into a narrow Agent Mode implementation task with dirty-worktree safety and lightweight checks.",
+          "source": "app",
+          "installPrompt": "Use the active developer app context to make a narrow code patch. Check git status first and verify with lightweight checks.",
+          "chipTitle": "Patch current issue",
+          "systemImage": "hammer.fill"
+        },
+        {
+          "id": "active-dev-debug-loop",
+          "title": "Debug current failure",
+          "detail": "Good for Terminal, Xcode, Cursor, or VS Code: inspect the visible error, trace the repo, patch, and verify.",
+          "source": "app",
+          "installPrompt": "Debug the failure visible in the active developer app, patch the smallest safe fix, and report the exact verification result.",
+          "chipTitle": "Debug failure",
+          "systemImage": "ladybug.fill"
+        }
+      ]
+    }
+  ]
+}

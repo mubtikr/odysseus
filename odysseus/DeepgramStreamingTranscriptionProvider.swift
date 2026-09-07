@@ -1,0 +1,373 @@
+//
+//  DeepgramStreamingTranscriptionProvider.swift
+//  odysseus
+//
+//  Streaming transcription provider backed by Deepgram's WebSocket API.
+//
+
+import AVFoundation
+import OCAudioCore
+import Foundation
+
+struct DeepgramStreamingTranscriptionProviderError: LocalizedError {
+    let message: String
+
+    var errorDescription: String? {
+        message
+    }
+}
+
+final class DeepgramStreamingTranscriptionProvider: BuddyTranscriptionProvider {
+    private let apiKey = AppBundleConfiguration.deepgramAPIKey()
+    private let modelName = AppBundleConfiguration.stringValue(forKey: "DeepgramTranscriptionModel") ?? "nova-3"
+
+    let displayName = "Deepgram"
+    let requiresSpeechRecognitionPermission = false
+
+    var isConfigured: Bool {
+        apiKey != nil
+    }
+
+    var unavailableExplanation: String? {
+        guard !isConfigured else { return nil }
+        return "Deepgram streaming is not configured. Add a Deepgram API key."
+    }
+
+    private let sharedWebSocketURLSession = URLSession(configuration: .default)
+
+    func startStreamingSession(
+        keyterms: [String],
+        onTranscriptUpdate: @escaping (String) -> Void,
+        onFinalTranscriptReady: @escaping (String) -> Void,
+        onError: @escaping (Error) -> Void
+    ) async throws -> any BuddyStreamingTranscriptionSession {
+        guard let apiKey else {
+            throw DeepgramStreamingTranscriptionProviderError(
+                message: unavailableExplanation ?? "Deepgram streaming is not configured."
+            )
+        }
+
+        let session = DeepgramStreamingTranscriptionSession(
+            apiKey: apiKey,
+            modelName: modelName,
+            urlSession: sharedWebSocketURLSession,
+            keyterms: keyterms,
+            onTranscriptUpdate: onTranscriptUpdate,
+            onFinalTranscriptReady: onFinalTranscriptReady,
+            onError: onError
+        )
+
+        try await session.open()
+        return session
+    }
+}
+
+private nonisolated final class DeepgramStreamingTranscriptionSession: StreamingWebSocketTranscriptionSession, @unchecked Sendable, BuddyStreamingTranscriptionSession {
+    private struct MessageEnvelope: Decodable {
+        let type: String?
+    }
+
+    private struct ResultsMessage: Decodable {
+        let type: String?
+        let is_final: Bool?
+        let speech_final: Bool?
+        let from_finalize: Bool?
+        let channel: Channel?
+    }
+
+    private struct Channel: Decodable {
+        let alternatives: [Alternative]
+    }
+
+    private struct Alternative: Decodable {
+        let transcript: String?
+    }
+
+    private struct ErrorMessage: Decodable {
+        let type: String?
+        let description: String?
+        let message: String?
+    }
+
+    private static let websocketBaseURLString = "wss://api.deepgram.com/v1/listen"
+    private static let targetSampleRate = 16_000.0
+    private static let explicitFinalTranscriptGracePeriodSeconds = 1.6
+
+    let finalTranscriptFallbackDelaySeconds: TimeInterval = 3.0
+
+    private let apiKey: String
+    private let modelName: String
+    private let keyterms: [String]
+    private let onTranscriptUpdate: (String) -> Void
+    private let onFinalTranscriptReady: (String) -> Void
+    private let onError: (Error) -> Void
+
+    private let stateQueue = DispatchQueue(label: "com.learningbuddy.deepgram.state")
+    private let audioPCM16Converter = BuddyPCM16AudioConverter(targetSampleRate: targetSampleRate)
+
+    private var audioFramesSent = 0
+    private var hasDeliveredFinalTranscript = false
+    private var isAwaitingExplicitFinalTranscript = false
+    private var isCancelled = false
+    private var committedTranscriptSegments: [String] = []
+    private var latestInterimTranscriptText = ""
+    private var explicitFinalTranscriptDeadlineWorkItem: DispatchWorkItem?
+
+    init(
+        apiKey: String,
+        modelName: String,
+        urlSession: URLSession,
+        keyterms: [String],
+        onTranscriptUpdate: @escaping (String) -> Void,
+        onFinalTranscriptReady: @escaping (String) -> Void,
+        onError: @escaping (Error) -> Void
+    ) {
+        self.apiKey = apiKey
+        self.modelName = modelName
+        self.keyterms = keyterms
+        self.onTranscriptUpdate = onTranscriptUpdate
+        self.onFinalTranscriptReady = onFinalTranscriptReady
+        self.onError = onError
+        super.init(urlSession: urlSession, sendQueueLabel: "com.learningbuddy.deepgram.send")
+    }
+
+    func open() async throws {
+        let websocketURL = try Self.makeWebsocketURL(modelName: modelName, keyterms: keyterms)
+        print("[Deepgram] opening WebSocket: \(websocketURL.absoluteString)")
+        var websocketRequest = URLRequest(url: websocketURL)
+        websocketRequest.setValue("Token \(apiKey)", forHTTPHeaderField: "Authorization")
+
+        openWebSocket(with: websocketRequest)
+    }
+
+    func appendAudioBuffer(_ audioBuffer: AVAudioPCMBuffer) {
+        guard let audioPCM16Data = audioPCM16Converter.convertToPCM16Data(from: audioBuffer),
+              !audioPCM16Data.isEmpty else {
+            return
+        }
+
+        audioFramesSent += 1
+        if audioFramesSent == 1 {
+            print("[Deepgram] first audio frame sent (\(audioPCM16Data.count) bytes)")
+        }
+        sendAudioData(audioPCM16Data) { [weak self] error in
+            print("[Deepgram] audio send error: \(error.localizedDescription)")
+            self?.failSession(with: error)
+        }
+    }
+
+    func requestFinalTranscript() {
+        stateQueue.async {
+            guard !self.hasDeliveredFinalTranscript else { return }
+            self.isAwaitingExplicitFinalTranscript = true
+            self.scheduleExplicitFinalTranscriptDeadline()
+        }
+
+        sendJSONMessage(["type": "Finalize"]) { [weak self] error in
+            self?.failSession(with: error)
+        }
+    }
+
+    func cancel() {
+        stateQueue.async {
+            self.isCancelled = true
+            self.explicitFinalTranscriptDeadlineWorkItem?.cancel()
+            self.explicitFinalTranscriptDeadlineWorkItem = nil
+        }
+
+        sendJSONMessage(["type": "CloseStream"]) { [weak self] error in
+            self?.failSession(with: error)
+        }
+        closeWebSocket()
+    }
+
+    override func handleReceiveFailure(_ error: Error) {
+        let nsError = error as NSError
+        let closeCode = webSocketTask?.closeCode.rawValue ?? -1
+        print("[Deepgram] receive failure: domain=\(nsError.domain) code=\(nsError.code) closeCode=\(closeCode) — \(error.localizedDescription)")
+        failSession(with: error)
+    }
+
+    override func handleIncomingText(_ text: String) {
+        guard let messageData = text.data(using: .utf8) else { return }
+
+        do {
+            let envelope = try JSONDecoder().decode(MessageEnvelope.self, from: messageData)
+            switch envelope.type?.lowercased() {
+            case "results":
+                let resultsMessage = try JSONDecoder().decode(ResultsMessage.self, from: messageData)
+                handleResultsMessage(resultsMessage)
+            case "error":
+                let errorMessage = try JSONDecoder().decode(ErrorMessage.self, from: messageData)
+                let messageText = errorMessage.description ?? errorMessage.message ?? "Deepgram returned an error."
+                print("[Deepgram] server error frame: \(messageText)")
+                failSession(with: DeepgramStreamingTranscriptionProviderError(message: messageText))
+            case "metadata":
+                print("[Deepgram] metadata frame received (session alive)")
+            case "speechstarted", "speech_started":
+                print("[Deepgram] speech started")
+            case "utteranceend", "utterance_end":
+                print("[Deepgram] utterance end")
+            default:
+                print("[Deepgram] unknown frame type: \(envelope.type ?? "nil") — \(text.prefix(200))")
+            }
+        } catch {
+            print("[Deepgram] failed to decode frame: \(error.localizedDescription) — raw=\(text.prefix(200))")
+            failSession(with: error)
+        }
+    }
+
+    private func handleResultsMessage(_ resultsMessage: ResultsMessage) {
+        let transcriptText = resultsMessage.channel?.alternatives.first?.transcript?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        stateQueue.async {
+            if resultsMessage.is_final == true || resultsMessage.speech_final == true {
+                if !transcriptText.isEmpty {
+                    self.committedTranscriptSegments.append(transcriptText)
+                }
+                self.latestInterimTranscriptText = ""
+            } else {
+                self.latestInterimTranscriptText = transcriptText
+            }
+
+            let fullTranscriptText = self.bestAvailableTranscriptText()
+            if !fullTranscriptText.isEmpty {
+                self.onTranscriptUpdate(fullTranscriptText)
+            }
+
+            guard self.isAwaitingExplicitFinalTranscript else { return }
+
+            if resultsMessage.from_finalize == true
+                || resultsMessage.is_final == true
+                || resultsMessage.speech_final == true {
+                self.explicitFinalTranscriptDeadlineWorkItem?.cancel()
+                self.explicitFinalTranscriptDeadlineWorkItem = nil
+                self.deliverFinalTranscriptIfNeeded(self.bestAvailableTranscriptText())
+            }
+        }
+    }
+
+    private func scheduleExplicitFinalTranscriptDeadline() {
+        explicitFinalTranscriptDeadlineWorkItem?.cancel()
+
+        let deadlineWorkItem = DispatchWorkItem { [weak self] in
+            self?.stateQueue.async {
+                guard let self else { return }
+                self.deliverFinalTranscriptIfNeeded(self.bestAvailableTranscriptText())
+            }
+        }
+
+        explicitFinalTranscriptDeadlineWorkItem = deadlineWorkItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.explicitFinalTranscriptGracePeriodSeconds,
+            execute: deadlineWorkItem
+        )
+    }
+
+    private func deliverFinalTranscriptIfNeeded(_ transcriptText: String) {
+        guard !hasDeliveredFinalTranscript else { return }
+        hasDeliveredFinalTranscript = true
+        explicitFinalTranscriptDeadlineWorkItem?.cancel()
+        explicitFinalTranscriptDeadlineWorkItem = nil
+        onFinalTranscriptReady(transcriptText)
+        sendJSONMessage(["type": "CloseStream"]) { [weak self] error in
+            self?.failSession(with: error)
+        }
+    }
+
+    private func failSession(with error: Error) {
+        let reportedError = Self.reportedError(for: error)
+        stateQueue.async {
+            // Log even when cancelled so silent-failure cases (server
+            // RST after stop, auth rejection right before close) are
+            // still visible. Don't deliver to onError if cancelled —
+            // dictation manager has already moved on.
+            if self.isCancelled {
+                print("[Deepgram] post-cancel failure (suppressed): \(reportedError.localizedDescription)")
+                return
+            }
+
+            let latestTranscriptText = self.bestAvailableTranscriptText()
+            if self.isAwaitingExplicitFinalTranscript
+                && !self.hasDeliveredFinalTranscript
+                && !latestTranscriptText.isEmpty {
+                print("[Deepgram] WebSocket error during finalization, delivering partial transcript: \(reportedError.localizedDescription)")
+                self.deliverFinalTranscriptIfNeeded(latestTranscriptText)
+                return
+            }
+
+            print("[Deepgram] Session failed with error: \(reportedError.localizedDescription)")
+            self.onError(reportedError)
+        }
+    }
+
+    private func bestAvailableTranscriptText() -> String {
+        var transcriptSegments = committedTranscriptSegments
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let trimmedInterimText = latestInterimTranscriptText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedInterimText.isEmpty {
+            transcriptSegments.append(trimmedInterimText)
+        }
+
+        return transcriptSegments.joined(separator: " ")
+    }
+
+    private static func reportedError(for error: Error) -> Error {
+        let nsError = error as NSError
+        guard nsError.domain == NSURLErrorDomain,
+              nsError.code == NSURLErrorBadServerResponse else {
+            return error
+        }
+
+        return DeepgramStreamingTranscriptionProviderError(
+            message: "Deepgram rejected the streaming connection. Check the Deepgram API key, account status, and transcription model."
+        )
+    }
+
+    private static func makeWebsocketURL(modelName: String, keyterms: [String]) throws -> URL {
+        guard var websocketURLComponents = URLComponents(string: websocketBaseURLString) else {
+            throw DeepgramStreamingTranscriptionProviderError(message: "Deepgram websocket URL is invalid.")
+        }
+
+        var queryItems = [
+            URLQueryItem(name: "model", value: modelName),
+            URLQueryItem(name: "encoding", value: "linear16"),
+            URLQueryItem(name: "sample_rate", value: "16000"),
+            URLQueryItem(name: "channels", value: "1"),
+            URLQueryItem(name: "interim_results", value: "true"),
+            URLQueryItem(name: "smart_format", value: "true"),
+            URLQueryItem(name: "endpointing", value: "300")
+        ]
+
+        // Deepgram replaced the legacy `keywords=` parameter on nova-3
+        // (and the upcoming nova-4 lineage) with `keyterm=`. Mixing
+        // `keywords` with `model=nova-3` causes the WebSocket upgrade
+        // to fail with `_NSURLErrorWebSocketHandshakeFailureReasonKey=0`
+        // (HTTP 400 at the upgrade). Detect by model-name prefix:
+        // nova-3 / nova-4 / future major bumps → keyterm. nova-2 and
+        // earlier → keywords (legacy).
+        let lowerModelName = modelName.lowercased()
+        let usesKeyterm = lowerModelName.hasPrefix("nova-3")
+            || lowerModelName.hasPrefix("nova-4")
+            || lowerModelName.hasPrefix("nova-5")
+        let keytermParameterName = usesKeyterm ? "keyterm" : "keywords"
+
+        for keyterm in keyterms
+            .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+            .filter({ !$0.isEmpty })
+            .prefix(25) {
+            queryItems.append(URLQueryItem(name: keytermParameterName, value: keyterm))
+        }
+
+        websocketURLComponents.queryItems = queryItems
+
+        guard let websocketURL = websocketURLComponents.url else {
+            throw DeepgramStreamingTranscriptionProviderError(message: "Deepgram websocket URL could not be created.")
+        }
+
+        return websocketURL
+    }
+}
