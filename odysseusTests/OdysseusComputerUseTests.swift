@@ -1,0 +1,346 @@
+import Foundation
+import OCComputerUseCore
+import Testing
+@testable import Odysseus
+
+struct OdysseusComputerUseTests {
+    @Test func realtimeCompositeAppCommandIsNotReducedToOpenApp() throws {
+        #expect(
+            CompanionManager.testLocalAppOpenTarget(
+                from: "Can you open Spotify and play AC/DC Back to Black?"
+            ) == nil
+        )
+        #expect(
+            CompanionManager.testLocalAppOpenTarget(
+                from: "Can you open Spotify and can you play AC/DC Back to Black?"
+            ) == nil
+        )
+        #expect(
+            CompanionManager.testLocalAppOpenTarget(
+                from: "Open Chrome and go to amazon.co.uk"
+            ) == nil
+        )
+        #expect(CompanionManager.testCompositeAppAction(from: "Open Chrome and go to amazon.co.uk") == nil)
+        #expect(CompanionManager.testWebOpenTarget(from: "Open Chrome and go to amazon.co.uk")?.url == "https://amazon.co.uk")
+        #expect(CompanionManager.testWebOpenTarget(from: "Open Chrome and go to amazon.co.uk")?.browserAppName == "Google Chrome")
+    }
+
+    @Test func directRequestRoutersDoNotStealQuestionsOrDesignTasks() throws {
+        #expect(CompanionManager.testLocalAppOpenTarget(from: "You open GitHub.") == "GitHub Desktop")
+        #expect(CompanionManager.testLocalFolderOpenTarget(from: "Is your working folder currently the Odysseus folder?") == nil)
+        #expect(CompanionManager.testLocalFolderOpenTarget(from: "look into introducing workspaces or project folders in Odysseus so I can configure named workspaces") == nil)
+        #expect(CompanionManager.testLocalFolderOpenTarget(from: "Take a look at /Users/jkneen/clawd/github/hf-realtime-voice — how could we integrate this into Odysseus?") == nil)
+    }
+
+    @Test func realtimeDoneTranscriptExtractionIgnoresTransportIds() throws {
+        let responseDone: [String: Any] = [
+            "type": "response.done",
+            "event_id": "event_DygDZLewDHSIBzmCqbYFv",
+            "response": [
+                "id": "resp_123",
+                "output": [
+                    [
+                        "type": "message",
+                        "content": [
+                            ["type": "output_text", "text": "Opening GitHub Desktop."]
+                        ]
+                    ]
+                ]
+            ]
+        ]
+        #expect(OpenAIRealtimeSpeechClient.testFirstTranscriptString(in: responseDone) == "Opening GitHub Desktop.")
+    }
+
+    @Test func pastedLogsDoNotBecomeReminderCountCommands() throws {
+        let pastedLogs = """
+        find out why we're having issues
+        [OdysseusLog][2026-06-09T11:22:08Z][computer-use/incoming] native_cua.direct_request.reminder_count_detected {"route":"native_cua.reminder_count","transcript":"count tasks reminders"}
+        """
+
+        #expect(CompanionManager.testLogEvidenceAnalysisInstruction(from: pastedLogs) != nil)
+        #expect(CompanionManager.testReminderCountInstruction(from: pastedLogs) == nil)
+    }
+
+    @Test func spokenPlayButtonRequestsMapToARealKey() throws {
+        #expect(CompanionManager.testNativeKeyPress(from: "Press play in Spotify.")?.key == "space")
+        #expect(CompanionManager.testNativeKeyPress(from: "Press the play button in Spotify.")?.key == "space")
+        #expect(CompanionManager.testNativeKeyPress(from: "Press play in Spotify.")?.modifiers == [])
+        #expect(CompanionManager.testNativeKeyPress(from: "Press command k in Spotify.")?.key == "k")
+        #expect(CompanionManager.testNativeKeyPress(from: "Press command k in Spotify.")?.modifiers == ["command"])
+    }
+
+    @Test func conversationalPageNavigationStaysInsideTheVoiceComputerUseTurn() throws {
+        #expect(CompanionManager.testNativeKeyPress(from: "To the next page.")?.key == "pagedown")
+        #expect(CompanionManager.testNativeKeyPress(from: "Can you take me to the next page?")?.key == "pagedown")
+        #expect(CompanionManager.testNativeKeyPress(from: "Go to the previous page.")?.key == "pageup")
+        #expect(CompanionManager.testNativeKeyPress(from: "Scroll one page up.")?.key == "pageup")
+    }
+
+    @Test func conversationalComputerUseClickRequestsStayOnDirectActionRoute() throws {
+        let referential = CompanionManager.testNativeClick(
+            from: "OK, can you do computer use then and click that?"
+        )
+        #expect(referential?.targetPhrase == nil)
+        #expect(referential?.prefersLastPointedElement == true)
+
+        let explicitComputerUse = CompanionManager.testNativeClick(
+            from: "Okay, use computer use to click that."
+        )
+        #expect(explicitComputerUse?.prefersLastPointedElement == true)
+
+        let correctedTarget = CompanionManager.testNativeClick(
+            from: "Oh, no, no. Click on my basket."
+        )
+        #expect(correctedTarget?.targetPhrase == "my basket")
+        #expect(correctedTarget?.prefersLastPointedElement == false)
+
+        #expect(
+            CompanionManager.testWebOpenTarget(
+                from: "yeah, open the browser and go to amazon dot co dot uk"
+            )?.url == "https://amazon.co.uk"
+        )
+    }
+
+    @MainActor @Test func compositeAppCommandsPreserveTheFollowUpAction() throws {
+        let spotifyAction = CompanionManager.testCompositeAppAction(
+            from: "Open Spotify and play AC/DC Back in Black."
+        )
+        #expect(spotifyAction?.appName == "Spotify")
+        #expect(spotifyAction?.actionText == "play AC/DC Back in Black")
+
+        let politeSpotifyAction = CompanionManager.testCompositeAppAction(
+            from: "Open Spotify and can you play AC/DC Back in Black?"
+        )
+        #expect(politeSpotifyAction?.appName == "Spotify")
+        #expect(politeSpotifyAction?.actionText == "play AC/DC Back in Black")
+
+        let mailAction = CompanionManager.testCompositeAppAction(
+            from: "Open Mail and search for invoices."
+        )
+        #expect(mailAction?.appName == "Mail")
+        #expect(mailAction?.actionText == "search for invoices")
+
+        let bareSpotifyAction = CompanionManager.testCompositeAppAction(
+            from: "Spotify and play Back in Black."
+        )
+        #expect(bareSpotifyAction?.appName == "Spotify")
+        #expect(bareSpotifyAction?.actionText == "play Back in Black")
+        #expect(CompanionManager.testSpotifyPlaybackQuery(from: "Spotify and play Back in Black.") == "Back in Black")
+        #expect(CompanionManager.testStandaloneSpotifyPlaybackQuery(from: "Can you play Back in Black?") == "Back in Black")
+        #expect(CompanionManager.testStandaloneSpotifyPlaybackQuery(from: "play the video") == nil)
+        #expect(CompanionManager.testStandaloneSpotifyPlaybackQuery(from: "Can you play Spotify?") == nil)
+        #expect(CompanionManager.testStandaloneSpotifyPlaybackQuery(from: "play anything in Spotify") == nil)
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "Can you play Spotify?") == "play")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "play anything in Spotify") == "play")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "play music") == "play")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "pause Spotify") == "pause")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "skip in Spotify") == "next")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "go back in Spotify") == "previous")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "turn shuffle on in Spotify") == "shuffleOn")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "turn shuffle off in Spotify") == "shuffleOff")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "turn repeat on in Spotify") == "repeatOn")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "turn repeat off in Spotify") == "repeatOff")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "turn Spotify volume up") == "volumeUp")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "turn Spotify volume down") == "volumeDown")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "increase Spotify volume") == "volumeUp")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "lower Spotify volume") == "volumeDown")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "set Spotify volume to 35 percent") == "volumeSet:35")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "set Spotify volume to 150") == "volumeSet:100")
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "turn volume up") == nil)
+        #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "mute volume") == nil)
+    }
+
+    @Test func standaloneSystemVolumeCommandsUseSystemAudioRoute() throws {
+        #expect(CompanionManager.testSystemVolumeControlAction(from: "turn volume up") == "volumeUp")
+        #expect(CompanionManager.testSystemVolumeControlAction(from: "turn volume down") == "volumeDown")
+        #expect(CompanionManager.testSystemVolumeControlAction(from: "mute") == "mute")
+        #expect(CompanionManager.testSystemVolumeControlAction(from: "mute volume") == "mute")
+        #expect(CompanionManager.testSystemVolumeControlAction(from: "set volume to 35 percent") == "setVolume:35")
+        #expect(CompanionManager.testSystemVolumeControlAction(from: "set volume to 150") == "setVolume:100")
+        #expect(CompanionManager.testSystemVolumeControlAction(from: "turn Spotify volume up") == nil)
+        #expect(CompanionManager.testSystemVolumeControlAction(from: "open Spotify and turn volume up") == nil)
+    }
+
+    @MainActor @Test func spotifySearchPlayRouteStaysOnComputerUseExecution() throws {
+        let nativeMethods = CompanionManager.testSpotifySearchPlayExecutionMethods(for: .nativeSwift)
+        #expect(nativeMethods.started == "NSWorkspace.open_spotify_uri + OdysseusNativeComputerUseController.pressKey + AppleScript playback verification")
+        #expect(nativeMethods.completed == "NSWorkspace.open_spotify_uri + OdysseusNativeComputerUseController.pressKey + AppleScript playback verification")
+        #expect(nativeMethods.completed.localizedCaseInsensitiveContains("AppleScript"))
+        #expect(nativeMethods.completed.localizedCaseInsensitiveContains("verification"))
+
+        let backgroundMethods = CompanionManager.testSpotifySearchPlayExecutionMethods(for: .backgroundComputerUse)
+        #expect(backgroundMethods.started == "NSWorkspace.open_spotify_uri + BackgroundComputerUse /v1/press_key + AppleScript playback verification")
+        #expect(backgroundMethods.completed == "NSWorkspace.open_spotify_uri + BackgroundComputerUse /v1/press_key + AppleScript playback verification")
+        #expect(backgroundMethods.completed.localizedCaseInsensitiveContains("AppleScript"))
+        #expect(backgroundMethods.completed.localizedCaseInsensitiveContains("verification"))
+    }
+
+    @MainActor @Test func voiceAgentStartFingerprintNormalizesDuplicateRealtimeRoutes() throws {
+        let first = CompanionManager.testVoiceAgentStartFingerprint(
+            instruction: "Figure out why our background computer-use path, C U A, is reporting background agent not started yet.",
+            route: "agent.hybrid_start"
+        )
+        let repeated = CompanionManager.testVoiceAgentStartFingerprint(
+            instruction: "figure out why our background computer use path c u a is reporting background agent not started yet",
+            route: "agent.hybrid_start"
+        )
+        #expect(first == repeated)
+    }
+
+    @Test func realtimeTwoIsTheDefaultVoiceInteractionModel() throws {
+        #expect(OdysseusModelCatalog.defaultVoiceResponseModelID == "gpt-realtime-2.1-mini")
+        #expect(OdysseusModelCatalog.defaultCodexActionsModelID != OdysseusModelCatalog.defaultVoiceResponseModelID)
+        #expect(OdysseusModelCatalog.speechModels.contains { $0.id == "gpt-realtime-2.1" })
+        #expect(OdysseusModelCatalog.speechModels.contains { $0.id == "gpt-realtime-2.1-mini" })
+    }
+
+    @Test func appleFoundationModelIsInVoiceCatalog() throws {
+        let apple = OdysseusModelCatalog.voiceResponseModel(withID: OdysseusModelCatalog.appleFoundationModelID)
+        #expect(apple.id == OdysseusModelCatalog.appleFoundationModelID)
+        #expect(apple.provider == .apple)
+        #expect(apple.provider.voiceBackendFamily == .apple)
+        #expect(apple.maxOutputTokens >= 64_000)
+        #expect(OdysseusVoiceBackendFamily.apple.defaultModelID == OdysseusModelCatalog.appleFoundationModelID)
+        #expect(OdysseusVoiceBackendFamily.claude.defaultModelID == "fable-5")
+        #expect(OdysseusVoiceBackendFamily.codex.defaultModelID == OdysseusModelCatalog.defaultCodexActionsModelID)
+        #expect(OdysseusVoiceBackendFamily.allCases.count == 3)
+
+        let claudeDefault = OdysseusModelCatalog.voiceResponseModel(withID: OdysseusVoiceBackendFamily.claude.defaultModelID)
+        #expect(claudeDefault.provider == .anthropic)
+        #expect(claudeDefault.provider.voiceBackendFamily == .claude)
+
+        let codexDefault = OdysseusModelCatalog.voiceResponseModel(withID: OdysseusVoiceBackendFamily.codex.defaultModelID)
+        #expect(codexDefault.provider.voiceBackendFamily == .codex)
+
+        // Apple is offered in the settings response grid via responseVoiceModels.
+        #expect(OdysseusModelCatalog.responseVoiceModels.contains { $0.id == OdysseusModelCatalog.appleFoundationModelID })
+        #expect(!OdysseusModelCatalog.isSpeechModelID(OdysseusModelCatalog.appleFoundationModelID))
+    }
+
+    @Test func providerDiscoveryReturnsThreeFamilies() throws {
+        let rows = OdysseusProviderDiscovery.availability()
+        #expect(rows.map(\.family) == [.apple, .codex, .claude])
+        for row in rows {
+            #expect(!row.statusLabel.isEmpty)
+            #expect(!row.detail.isEmpty)
+            #expect(OdysseusProviderDiscovery.isAvailable(row.family) == row.isAvailable)
+        }
+    }
+
+    @Test func responseOverlayAutoHideCancelsPriorScheduleBeforeReschedule() throws {
+        var policy = ResponseOverlayAutoHidePolicy()
+        let first = policy.schedule(now: 0, holdSeconds: 6)
+        #expect(policy.isCurrent(first))
+        #expect(policy.shouldHide(now: 6, generation: first))
+
+        // Mid-stream chunk: cancel-before-schedule must invalidate the first hide.
+        let second = policy.schedule(now: 1.5, holdSeconds: 6)
+        #expect(second != first)
+        #expect(!policy.isCurrent(first))
+        #expect(!policy.shouldHide(now: 6, generation: first), "stale first-chunk hide must not fire")
+        #expect(policy.shouldHide(now: 7.5, generation: second))
+        #expect(!policy.shouldHide(now: 7.4, generation: second))
+
+        // updateStreamingText path: cancel alone keeps bubble open with no pending hide.
+        policy.cancel()
+        #expect(policy.scheduledHideAt == nil)
+        #expect(!policy.shouldHide(now: 100, generation: second))
+    }
+
+    @Test func responseOverlayAutoHideDefaultHoldIsLongerThanIdleCaptionClear() throws {
+        // Cursor caption clears at ~1.2s on voice idle; interactive bubble must
+        // outlive that so the provider selector remains usable (criterion 3).
+        #expect(ResponseOverlayAutoHidePolicy.defaultHoldSeconds > 1.2)
+        #expect(ResponseOverlayAutoHidePolicy.defaultHoldSeconds >= 6)
+    }
+
+    @Test func retiredRealtimeTwoAliasMigratesToCurrentMiniDefault() throws {
+        #expect(OdysseusModelCatalog.normalizedModelID("gpt-realtime-2") == "gpt-realtime-2.1-mini")
+        #expect(OdysseusModelCatalog.voiceResponseModel(withID: "gpt-realtime-2").id == "gpt-realtime-2.1-mini")
+        #expect(OdysseusModelCatalog.speechModel(withID: "gpt-realtime-2").id == "gpt-realtime-2.1-mini")
+        #expect(OdysseusModelCatalog.isSpeechModelID("gpt-realtime-2"))
+        #expect(OdysseusModelCatalog.computerUseModel(withID: "gpt-realtime-2").id == "gpt-realtime-2.1-mini")
+    }
+
+    @Test func unknownVoiceModelIDsFallBackToSpeechDefaultNotHaiku() throws {
+        let resolved = OdysseusModelCatalog.voiceResponseModel(withID: "definitely-not-a-real-model-id")
+        #expect(resolved.id == OdysseusModelCatalog.defaultVoiceResponseModelID)
+        #expect(OdysseusModelCatalog.isSpeechModelID(resolved.id))
+        #expect(resolved.id != "fable-5")
+    }
+
+    @Test func realtimeTwoUsesLowReasoningEffortForVoiceLatency() throws {
+        #expect(OpenAIRealtimeSpeechClient.realtimeReasoningConfiguration(for: "gpt-realtime-2.1-mini")?["effort"] == "low")
+        #expect(OpenAIRealtimeSpeechClient.realtimeReasoningConfiguration(for: "gpt-realtime-2.1")?["effort"] == "low")
+        #expect(OpenAIRealtimeSpeechClient.realtimeReasoningConfiguration(for: "gpt-realtime-2")?["effort"] == "low")
+        #expect(OpenAIRealtimeSpeechClient.realtimeReasoningConfiguration(for: "gpt-realtime-1.5") == nil)
+    }
+
+    @Test func voiceResponseModelsDoNotUseShortTTSGenerationCap() throws {
+        let responseBudgets = OdysseusModelCatalog.responseVoiceModels.map(\.maxOutputTokens)
+        #expect(responseBudgets.allSatisfy { $0 >= 64_000 })
+    }
+
+    @Test func realtimeModelsResolveToNonSpeechModelsOutsideRealtimeTransport() throws {
+        let analysisModel = OdysseusModelCatalog.voiceAnalysisModel(withID: "gpt-realtime-2.1-mini")
+        #expect(analysisModel.id == OdysseusModelCatalog.defaultVoiceAnalysisModelID)
+        #expect(!OdysseusModelCatalog.isSpeechModelID(analysisModel.id))
+
+        let codexModel = OdysseusModelCatalog.codexVoiceSessionModel(withID: "gpt-realtime-2.1-mini")
+        #expect(codexModel.id == OdysseusModelCatalog.defaultCodexActionsModelID)
+        #expect(!OdysseusModelCatalog.isSpeechModelID(codexModel.id))
+    }
+
+    @Test func nonSpeechModelsRemainSelectedForVoiceAnalysis() throws {
+        #expect(OdysseusModelCatalog.voiceAnalysisModel(withID: "gpt-5.6-sol").id == "gpt-5.6-sol")
+        #expect(OdysseusModelCatalog.codexVoiceSessionModel(withID: "gpt-5.6-sol").id == "gpt-5.6-sol")
+    }
+
+    @Test func realtimeVoiceUsesRealtimeForComputerUsePointing() throws {
+        #expect(
+            CompanionManager.testComputerUsePointingResolver(
+                selectedVoiceModelID: "gpt-realtime-2.1-mini",
+                selectedComputerUseModelID: "gpt-5.6-sol"
+            ) == "openai_realtime"
+        )
+    }
+
+    @Test func realtimeComputerUseModelUsesRealtimeAPIInsteadOfCodex() throws {
+        let model = OdysseusModelCatalog.computerUseModel(withID: "gpt-realtime-2.1-mini")
+        #expect(model.provider == .openAI)
+        #expect(
+            CompanionManager.testComputerUsePointingResolver(
+                selectedVoiceModelID: "gpt-5.6-sol",
+                selectedComputerUseModelID: "gpt-realtime-2.1-mini"
+            ) == "openai_realtime"
+        )
+    }
+
+    @Test func nonRealtimeVoiceKeepsSelectedComputerUsePointingResolver() throws {
+        #expect(
+            CompanionManager.testComputerUsePointingResolver(
+                selectedVoiceModelID: "gpt-5.6-sol",
+                selectedComputerUseModelID: "gpt-5.6-sol"
+            ) == "codex_cli"
+        )
+        #expect(
+            CompanionManager.testComputerUsePointingResolver(
+                selectedVoiceModelID: "fable-5",
+                selectedComputerUseModelID: "gpt-5.6-sol"
+            ) == "codex_cli"
+        )
+        #expect(
+            CompanionManager.testComputerUsePointingResolver(
+                selectedVoiceModelID: "fable-5",
+                selectedComputerUseModelID: "sonnet-5"
+            ) == "anthropic_api"
+        )
+    }
+
+    @Test func codexPointDetectorDoesNotUseRemovedApprovalFlag() throws {
+        let arguments = CodexPointDetector.testCodexExecArguments()
+        #expect(!arguments.contains("--ask-for-approval"))
+        #expect(arguments.contains("-c"))
+        #expect(arguments.contains("approval_policy=\"never\""))
+    }
+}
