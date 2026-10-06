@@ -1,0 +1,82 @@
+name: build-dmg
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dmg-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dmg:
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode 26.3
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.3'
+
+      - name: Derive version
+        id: version
+        run: |
+          set -euo pipefail
+          LAST_TAG="$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "v1.1.0")"
+          echo "previous tag: ${LAST_TAG}"
+          BASE="${LAST_TAG#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE"
+          PATCH=$((PATCH + 1))
+          VERSION="$MAJOR.$MINOR.$PATCH"
+          BUILD="${{ github.run_number }}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Archive + package DMG
+        id: build
+        run: |
+          set -euo pipefail
+          bash scripts/release.sh "${{ steps.version.outputs.version }}" "${{ steps.version.outputs.build }}" --local \
+            > release.log 2>&1 || { tail -60 release.log; exit 1; }
+          tail -12 release.log
+          DMG_PATH="dist/Odysseus-${{ steps.version.outputs.version }}-${{ steps.version.outputs.build }}.dmg"
+          echo "dmg=$DMG_PATH" >> "$GITHUB_OUTPUT"
+          SHA256=$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Stage release notes
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/notes.md" <<EOF
+          **Odysseus ${{ steps.version.outputs.version }} (build ${{ steps.version.outputs.build }})**
+
+          - Voice: on-device transcription (Parakeet / Apple Speech) + Microsoft Edge neural TTS
+          - Brain: DeepSeek V4.1 Flash via OpenCode Go (OPENCODE_API_KEY), Apple Foundation Models when Apple Intelligence is enabled
+          - Agent Mode: runs agent tasks on the configured model (Go gateway), screen-aware with inline screenshots
+
+          Install: mount the DMG and drag Odysseus to Applications.
+          First launch: right-click the app and choose **Open** once (ad-hoc signed build), or:
+          \`xattr -dr com.apple.quarantine /Applications/Odysseus.app\`
+
+          SHA-256: \`${{ steps.build.outputs.sha256 }}\`
+          EOF
+
+      - name: Create GitHub Release with DMG
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Odysseus ${{ steps.version.outputs.version }}
+          body_path: ${{ runner.temp }}/notes.md
+          files: dist/*.dmg
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
