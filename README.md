@@ -73,3 +73,29 @@ also signs, notarizes, and (optionally, with `SPARKLE_ED_PRIVATE_KEY`) publishes
 - LLM calls go only to the provider you configure (OpenCode Go DeepSeek — zero retention, no training; Apple on-device — nothing leaves the Mac).
 - Screen captures: local files until a request needs vision; never pooled or synced.
 - No cloud login, no hosted key storage.
+## License
+
+Odysseus is released under the [MIT License](LICENSE).
+
+```
+MIT License
+Copyright (c) 2026 mubtikr
+```
+
+You are free to use, modify, distribute, and sell — attribution is appreciated but not required. Third-party code and model credits live in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Contributing
+
+Contributions are welcome — the project is public and MIT-licensed.
+
+- **Bugs / ideas:** open a [GitHub Issue](https://github.com/mubtikr/odysseus/issues) with the macOS version, model, and a short repro.
+- **Code:** fork → feature branch (`feat/<topic>`) → PR. Keep diffs focused; CI is the gate (DMG build on every push to `main` plus selected PRs).
+- **Checks before you push:** `xcrun swiftc -parse` on touched Swift files, and a local DMG build (`bash scripts/release.sh 1.1.0 1 --local`) if you touch packaging.
+- No Claude Code / AI-generated commit attribution, no personal API keys, no binaries — DMGs come from CI only.
+- Brain + model additions follow the provider routing rules in AGENTS.md (free/local-first, per-family routing, money rule).
+
+### Roadmap ideas
+
+- Shell/file tools for Agent Mode on the Go gateway
+- Optional Sparkle auto-update feed (Ed25519-signed `appcast.xml`)
+- More STT/TTS providers behind the existing routing switch
